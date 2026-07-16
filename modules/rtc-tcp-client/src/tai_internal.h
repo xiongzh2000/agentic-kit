@@ -101,7 +101,12 @@
  * JSON). A packet that reassembles larger is fail-fast (TAI_PROTO_ERR_FRAG).
  * 32000 ≈ 7 max fragments. */
 #ifndef TAI_FRAG_BUF_SIZE
-#  define TAI_FRAG_BUF_SIZE     32000U
+/* 256 KB: a generateImage/on_image response can carry the stylised JPEG in a
+ * single large application packet (well over the old 32000 ≈ 7-fragment bound),
+ * which would otherwise fail-fast as TAI_PROTO_ERR_FRAG and drop the session.
+ * frag_buf lives in tai_ctx (PSRAM-allocated by the app), so the extra RAM is
+ * external. */
+#  define TAI_FRAG_BUF_SIZE     262144U
 #endif
 /* Control-packet assembly buffer. Must hold the largest control application
  * packet — dominated by the session/event JSON escaped into attr 111. The
