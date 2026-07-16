@@ -10,7 +10,9 @@
 #include "rng.h"
 
 #include "atop.h"
+#include "atop_base.h"
 #include "cJSON.h"
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -522,6 +524,50 @@ IOT_API int iot_client_get_session_token(iot_client_t *client, const char *agent
     token[resp_token_len] = '\0';
     client->pal->free(resp.token);
     return OPRT_OK;
+}
+
+IOT_API int iot_client_atop_request(iot_client_t *client,
+                                    const char *api, const char *version,
+                                    const char *body_json, char **result_json_out)
+{
+    if (client == NULL || api == NULL || version == NULL || result_json_out == NULL) {
+        return OPRT_INVALID_PARAMETER;
+    }
+    *result_json_out = NULL;
+    const char *body = body_json ? body_json : "{}";
+
+    char parsed_host[64] = {0};
+    uint16_t parsed_port = IOT_DEFAULT_PORT;
+    iot_client_resolve_atop_host(client, parsed_host, sizeof(parsed_host), &parsed_port);
+
+    atop_base_request_t req = {
+        .devid              = client->devid,
+        .key                = client->secret_key,
+        .path               = "/d.json",
+        .api                = api,
+        .version            = version,
+        .timestamp          = (uint32_t)time(NULL),
+        .data               = (void *)body,
+        .datalen            = strlen(body),
+        .host               = parsed_host[0] ? parsed_host : NULL,
+        .port               = parsed_port,
+        .cacert             = client->cacert,
+        .cert_bundle_attach = client->cert_bundle_attach,
+    };
+
+    atop_base_response_t resp = {0};
+    int rt = atop_base_request(client->pal, &req, &resp);
+    if (rt != OPRT_OK) {
+        log_error("iot_client_atop_request(%s) failed: %d", api, rt);
+        atop_base_response_free(client->pal, &resp);
+        return rt;
+    }
+    if (resp.result) {
+        char *s = cJSON_PrintUnformatted(resp.result);
+        if (s) { *result_json_out = pal_strdup(client->pal, s); cJSON_free(s); }
+    }
+    atop_base_response_free(client->pal, &resp);
+    return (*result_json_out != NULL) ? OPRT_OK : OPRT_INVALID_RESULT;
 }
 
 IOT_API int iot_client_process(iot_client_t *client, uint32_t timeout_ms)

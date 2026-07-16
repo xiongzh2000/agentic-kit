@@ -243,6 +243,25 @@ IOT_API int iot_client_publish(iot_client_t *client, const uint8_t *data, size_t
 IOT_API int iot_client_get_session_token(iot_client_t *client, const char *agent_code, char *token, size_t token_len);
 
 /**
+ * @brief Call an arbitrary device-authenticated ATOP API by name.
+ *
+ * Signs and POSTs to the device ATOP gateway (/d.json) using this client's
+ * device credentials, mirroring the built-in ATOP calls. Use for device-side
+ * business APIs such as "m.tc.image.style.templates.get".
+ *
+ * @param client          Pointer to iot_client_t instance (must not be NULL)
+ * @param api             ATOP API name (e.g. "m.tc.image.style.templates.get")
+ * @param version         API version string (e.g. "3.0")
+ * @param body_json       Request body as a JSON object string ("{}" if none)
+ * @param result_json_out Output: the response "result" serialized to JSON
+ *                        (caller frees via the SDK pal->free). NULL on failure.
+ * @return OPRT_OK on success, error code otherwise
+ */
+IOT_API int iot_client_atop_request(iot_client_t *client,
+                                    const char *api, const char *version,
+                                    const char *body_json, char **result_json_out);
+
+/**
  * @brief Get CA certificate for a target host via IoT DNS service.
  *
  * @param client         Pointer to iot_client_t instance (must not be NULL)
