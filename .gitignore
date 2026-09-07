@@ -8,6 +8,7 @@ build-*
 venv
 .cache
 *.pcm
+*.mp3
 *.o
 third_party/*
 !third_party/mbedtls
@@ -35,3 +36,8 @@ docs-site/node_modules/
 docs-site/.docusaurus/
 docs-site/build/
 docs-site/yarn-error.log
+
+.auto-memory.yaml
+.vimspector.json
+Testing
+spec

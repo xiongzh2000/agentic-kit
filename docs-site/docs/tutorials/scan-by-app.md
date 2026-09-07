@@ -49,8 +49,7 @@ iot_client_deinit()                  // 5. 清理资源
 ### `iot_get_qrcode_info()`
 
 ```c
-int iot_get_qrcode_info(const iot_qrcode_request_t *request,
-                        iot_qrcode_response_t *response);
+int iot_get_qrcode_info(const iot_qrcode_request_t *request, char *url, size_t url_len);
 ```
 
 向涂鸦云请求一个用于配网激活的 URL。设备将此 URL 编码为二维码展示给用户。
@@ -63,9 +62,11 @@ int iot_get_qrcode_info(const iot_qrcode_request_t *request,
 | `authkey` | 设备 Auth Key |
 | `app_id` | App ID（可为空字符串） |
 | `type` | 二维码类型（通常为 1） |
+| `region` | 数据中心区域（默认 `AY` 中国） |
 | `env` | 环境：`PROD` / `PRE` |
+| `cacert` / `cert_bundle_attach` | HTTPS/IoT-DNS 的 TLS 证书配置，详见 [TLS 证书验证](../guides/tls-cert-verification.md) |
 
-**返回值：** `OPRT_OK` 表示成功，`response->url` 中包含激活 URL（调用方需 `free`）。
+**返回值：** `OPRT_OK` 表示成功，激活 URL 写入调用方提供的 `url` 缓冲区（NUL 结尾；缓冲区不够大时返回 `OPRT_INVALID_RESULT`）。
 
 ### `iot_client_init_on_boarding()`
 
@@ -75,6 +76,23 @@ iot_client_t *iot_client_init_on_boarding(const iot_on_boarding_config_t *config
 
 阻塞等待用户通过 App 扫码完成激活。内部会通过 MQTT 监听激活事件，当 App 扫
 码并确认配网后自动完成设备激活。
+
+:::warning 必须连接 MQTT，App 才判定配网成功
+**App 只有在检测到设备连接上涂鸦云 MQTT 通道（设备上线）后，才会判定配网成功。**
+仅完成激活、拿到 `devid` 等凭据但不连接 MQTT，App 端会显示配网失败/超时。
+
+因此这一点现在由默认行为保证——自动连接是默认开启的，无需额外配置；只要不设 `.mqtt_disable_auto_connect`，设备就会在激活完成后自动连接 MQTT：
+
+```c
+iot_on_boarding_config_t ob_config = {
+    // ...
+    // 不设 .mqtt_disable_auto_connect：默认即自动连接 MQTT，App 才能判定配网成功
+};
+```
+
+若选择保持 `false`，则必须在激活成功后立即手动调用
+`iot_client_connect()`。
+:::
 
 **与 `iot_client_init_on_boarding_with_token()` 的区别：**
 
@@ -104,7 +122,7 @@ iot_client_t *iot_client_init_on_boarding(const iot_on_boarding_config_t *config
 
 ## 注意事项
 
-- 此方式要求设备已具备网络连接能力（Wi-Fi 或以太网），在 APP 扫码配网过程中，设备需与涂鸦平台建立 MQTT 连接。
+- 此方式要求设备已具备网络连接能力（Wi-Fi 或以太网），且设备必须在激活后连接涂鸦平台的 MQTT 通道——**App 以设备 MQTT 上线作为配网成功的判定条件**（见上文警告，切勿设 `.mqtt_disable_auto_connect = true`）。
 - `iot_client_init_on_boarding()` 会阻塞直到 App 扫码完成或超时
   （`timeout_ms` 配置），实际产品中建议在单独线程中调用。
 - 本示例使用 `qrcodegen`（nayuki 库）生成二维码，实际产品可替换为任意

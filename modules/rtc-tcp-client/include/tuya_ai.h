@@ -64,7 +64,13 @@ extern "C" {
 #define TAI_EVT_PAYLOADS_END     1
 #define TAI_EVT_END              2
 #define TAI_EVT_ONE_SHOT         3
+/* Server-sent. Doubles as the cloud-VAD turn boundary: the current cloud sends
+ * this when the user stops speaking (or speaks over the reply) and no longer
+ * sends TAI_EVT_SERVER_VAD. Device response: clear the interrupted turn's
+ * downlink playback; keep the uplink audio Event open (no audio_end/start). */
 #define TAI_EVT_CHAT_BREAK       4
+/* Legacy server-sent turn-end signal. The current cloud does not send it;
+ * kept for protocol compatibility. Do not build new handling on it. */
 #define TAI_EVT_SERVER_VAD       5
 #define TAI_EVT_MCP_CMD          1000
 #define TAI_EVT_SERVER_TIMEOVER  1001
@@ -410,7 +416,7 @@ int tai_send_mcp_response(tai_ctx_t *ctx, const char *json_rpc_response);
  *
  *   1. Compile-time maximum (TAI_LOG_LEVEL, default 4 = DEBUG).
  *      Messages above this level are optimised away at build time.
- *   2. Runtime level, set via tai_set_log_level().  Default: TAI_LOG_DEBUG.
+ *   2. Runtime level, set via tai_set_log_level().  Default: TAI_LOG_INFO.
  *
  * These thin inlines exist for source-compatibility with callers; new
  * code should prefer log_set_level() / log_get_level() directly.

@@ -44,6 +44,15 @@ tuya_ble_nimble_stop()              // 4. 停止 BLE 广播
 iot_client_init_on_boarding_with_token(token)  // 6. 用 Token 激活设备
 ```
 
+:::warning 必须连接 MQTT，App 才判定配网成功
+**App 只有在检测到设备连接上涂鸦云 MQTT 通道（设备上线）后，才会判定配网成功。**
+仅完成 Token 激活、拿到 `devid` 等凭据但不连接 MQTT，App 端会显示配网失败/超时。
+
+因此这一点现在由默认行为保证——自动连接是默认开启的，无需额外配置；只要不设 `.mqtt_disable_auto_connect`，设备就会在激活完成后自动连接 MQTT（示例 `main/main.c` 中
+已如此配置）；若保持 `false`，则必须在激活成功后立即手动调用
+`iot_client_connect()`。
+:::
+
 ## 关键代码
 
 ### 配置与启动
@@ -68,7 +77,7 @@ void app_main(void)
     nvs_flash_init();
 
     tuya_ble_prov_cfg_t prov_cfg = {
-        .device_name = "TuyaDevice",    // BLE 广播名称
+        .device_name = "TYBLE",         // BLE 广播名称（最长 5 字符，超出会被截断）
         .product_key = PRODUCT_KEY,     // 产品 PID
         .uuid        = DEVICE_UUID,     // 设备 UUID
         .auth_key    = AUTH_KEY,        // 设备 Auth Key
@@ -91,7 +100,7 @@ void app_main(void)
 ### 配置文件 `app_config.h`
 
 ```c
-#define TUYA_BLE_DEVICE_NAME  "TuyaDevice"
+#define TUYA_BLE_DEVICE_NAME  "TYBLE"   // 最长 5 字符（TUYA_BLE_NAME_MAX_LEN），超出会被截断
 #define PRODUCT_KEY           "your_product_key"
 #define DEVICE_UUID           "your_uuid"
 #define AUTH_KEY              "your_auth_key"
@@ -115,7 +124,7 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg);
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `device_name` | `const char *` | BLE 广播设备名 |
+| `device_name` | `const char *` | BLE 广播设备名（最长 5 字符 `TUYA_BLE_NAME_MAX_LEN`，超出部分被静默截断） |
 | `product_key` | `const char *` | 产品 PID |
 | `uuid` | `const char *` | 设备 UUID |
 | `auth_key` | `const char *` | 设备 Auth Key |
@@ -129,7 +138,7 @@ int tuya_ble_nimble_stop(void);
 
 停止 BLE 广播和服务，释放 NimBLE 资源。
 
-**返回值：** `0` 成功，非零表示错误。
+**返回值：** 当前实现始终返回 `0`（内部 `nimble_port_stop()` 的结果被忽略，不返回错误码）。
 
 ### `tuya_ble_wifi_creds_t`
 
@@ -163,4 +172,5 @@ idf.py flash monitor
 - BLE 配网完成后应尽快停止 BLE 广播（`tuya_ble_nimble_stop`），避免与 WiFi 共存时的射频冲突。
 - Token 格式与其他配网方式一致：前两字符为 Region 编码。
 - 配网完成后的设备激活流程与[设备扫码配网](./scan-by-device)相同，使用 `iot_client_init_on_boarding_with_token()`。
+- 切勿在激活配置中设 `.mqtt_disable_auto_connect = true`：**App 以设备 MQTT 上线作为配网成功的判定条件**，不连接 MQTT 时 App 会显示配网失败/超时。
 - 需确保项目正确引用了 `modules/tuya-ble/` 和 `modules/iot-client/` 组件。

@@ -16,7 +16,7 @@ sidebar_position: 1
 
 - **简洁 API**：类型化发送函数（`tai_send_text`、`tai_send_audio_*`、`tai_send_image`），无需手动组装数据结构体
 - **后台接收线程**：`tai_connect` 后自动启动后台线程处理接收和 keepalive
-- **回调驱动**：通过 `on_audio`、`on_text`、`on_event`、`on_disconnect` 接收数据
+- **回调驱动**：通过 `on_audio`、`on_text`、`on_image`、`on_event`、`on_disconnect` 接收数据
 - **无外部依赖**：用户 PAL 只需提供原始 TCP 和平台原语；TLS 和加密由 SDK 内部通过 bundled mbedTLS 处理
 
 
@@ -29,6 +29,7 @@ sidebar_position: 1
 | 宏 | 值 | 说明 |
 |----|---|------|
 | `TAI_PKT_CLIENT_HELLO` | 1 | 客户端握手 |
+| `TAI_PKT_AUTHENTICATE_RESPONSE` | 3 | 服务端对 ClientHello 的鉴权结果 |
 | `TAI_PKT_PING` | 4 | 心跳请求 |
 | `TAI_PKT_PONG` | 5 | 心跳响应 |
 | `TAI_PKT_CONNECTION_CLOSE` | 6 | 连接关闭 |
@@ -60,8 +61,8 @@ sidebar_position: 1
 | `TAI_EVT_PAYLOADS_END` | 1 | 负载结束 |
 | `TAI_EVT_END` | 2 | 会话结束 |
 | `TAI_EVT_ONE_SHOT` | 3 | 单次事件 |
-| `TAI_EVT_CHAT_BREAK` | 4 | 聊天打断（用户中途说话） |
-| `TAI_EVT_SERVER_VAD` | 5 | 云端 VAD 检测到用户停止说话 |
+| `TAI_EVT_CHAT_BREAK` | 4 | 聊天打断/云端 VAD 回合结束（用户停止说话或中途插话）；当前云端以此作为回合边界信号；只需清除下行 TTS 缓存/播放队列，不要结束上行 Event |
+| `TAI_EVT_SERVER_VAD` | 5 | 云端 VAD 检测到用户停止说话（旧服务端信号，**当前云端不再下发**，常量仅为协议兼容保留） |
 | `TAI_EVT_MCP_CMD` | 1000 | MCP 命令（设备侧执行） |
 | `TAI_EVT_SERVER_TIMEOVER` | 1001 | 服务端超时 |
 | `TAI_EVT_UPDATE_CONTEXT` | 1002 | 上下文更新 |
@@ -148,8 +149,8 @@ sidebar_position: 1
 |------|------|------|
 | `device_id` | `const char *` | 设备 ID（配网后获得的 devid） |
 | `local_key` | `const char *` | 本地密钥（配网后获得的 local_key） |
-| `client_type` | `uint8_t` | 客户端类型：`TAI_CLIENT_DEVICE` 或 `TAI_CLIENT_APP` |
-| `protocol_version` | `uint8_t` | 协议版本：使用 `TAI_VER_21` |
+| `client_type` | `uint8_t` | 客户端类型：`TAI_CLIENT_DEVICE` 或 `TAI_CLIENT_APP`（0 = 默认 `TAI_CLIENT_DEVICE`） |
+| `protocol_version` | `uint8_t` | 协议版本：使用 `TAI_VER_21`（0 = 默认 `TAI_VER_21`） |
 
 ### 3.3 会话选项
 
@@ -163,14 +164,14 @@ sidebar_position: 1
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `biz_code` | `uint32_t` | 业务码 |
-| `biz_tag` | `uint64_t` | 业务标签 |
+| `biz_code` | `uint32_t` | 业务码（0 = 默认 `65537`） |
+| `biz_tag` | `uint64_t` | 业务标签（0 = 默认 `119`） |
 
 ### 3.5 安全配置
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `sign_level` | `uint8_t` | 签名级别：`TAI_SIGN_NONE` / `TAI_SIGN_HMAC_SHA256`（推荐） |
+| `sign_level` | `uint8_t` | 签名级别：`TAI_SIGN_HMAC_SHA256`（推荐）或 `TAI_SIGN_HMAC_SHA1`。注意 `TAI_SIGN_NONE`（0）会被视为"未设置"而强制回退到 `TAI_SIGN_HMAC_SHA256`，无法通过该字段关闭签名 |
 
 ### 3.6 保活配置
 
@@ -178,7 +179,7 @@ sidebar_position: 1
 |------|------|------|
 | `ping_interval_ms` | `uint32_t` | Ping 间隔（0 = 默认 60000ms） |
 | `ping_timeout_ms` | `uint32_t` | Ping 超时（0 = 默认 90000ms） |
-| `connect_timeout_ms` | `uint32_t` | 连接超时（0 = 默认 5000ms）。分别约束 `tai_connect` 的两个串行等待阶段：先是 TLS 握手，再是服务端 SessionNew 应答。任一阶段超时即判定连接失败，因此 `tai_connect` 最坏耗时约为该值的 2 倍（握手 + 应答）。 |
+| `connect_timeout_ms` | `uint32_t` | 连接超时（0 = 默认 5000ms）。分别约束 `tai_connect` 的两个串行等待阶段：先是连接建立（TCP 建连 + TLS 握手，共用一份预算），再是服务端 SessionNew 应答。任一阶段超时即判定连接失败，因此 `tai_connect` 最坏耗时约为该值的 2 倍。 |
 
 ### 3.7 测试配置
 
@@ -191,6 +192,7 @@ sidebar_position: 1
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `pal` | `const pal_t *` | 平台适配层实现指针 |
+| `cert_bundle_attach` | `tls_cert_bundle_attach_fn` | 平台证书包回调（ESP-IDF 上设为 `esp_crt_bundle_attach`，否则 TLS 不做证书校验）；NULL 表示不使用。详见 [TLS 证书验证](../guides/tls-cert-verification.md) |
 
 ### 3.9 回调函数
 
@@ -200,6 +202,7 @@ sidebar_position: 1
 |------|------|------|
 | `on_audio` | function pointer | 音频数据回调 |
 | `on_text` | function pointer | 文本数据回调 |
+| `on_image` | function pointer | 图像数据回调（云端生成的图片） |
 | `on_event` | function pointer | 事件回调（MCP、打断、VAD 等） |
 | `on_disconnect` | function pointer | 断连回调 |
 | `user_data` | `void *` | 透传到所有回调 |
@@ -211,6 +214,7 @@ sidebar_position: 1
 ```c
 void (*on_audio)     (tai_ctx_t *ctx, const tai_audio_msg_t      *msg, void *user_data);
 void (*on_text)      (tai_ctx_t *ctx, const tai_text_msg_t       *msg, void *user_data);
+void (*on_image)     (tai_ctx_t *ctx, const tai_image_msg_t      *msg, void *user_data);
 void (*on_event)     (tai_ctx_t *ctx, const tai_event_msg_t      *msg, void *user_data);
 void (*on_disconnect)(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void *user_data);
 ```
@@ -241,6 +245,24 @@ void (*on_disconnect)(tai_ctx_t *ctx, const tai_disconnect_msg_t *msg, void *use
 | `data_id` | `uint16_t` | 数据 ID：`TAI_DATA_ID_TEXT_DOWN`(4) |
 | `seq` | `uint32_t` | 每事件内文本序号（varint） |
 | `event_id` | `const char *` | turn id（借用）；无则为 `""` |
+
+`tai_image_msg_t`（图像回调）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `data` | `const uint8_t *` | 编码图像字节（JPEG/PNG）；回调生命周期内有效 |
+| `len` | `size_t` | 数据字节数 |
+| `format` | `uint8_t` | `TAI_IMG_JPEG` / `TAI_IMG_PNG` / 0=未知 |
+| `width` | `uint16_t` | 宽（px），未知或非 START/ONE_SHOT 包时为 0 |
+| `height` | `uint16_t` | 高（px），未知或非 START/ONE_SHOT 包时为 0 |
+| `stream_flag` | `uint8_t` | `TAI_STREAM_*` |
+| `data_id` | `uint16_t` | 数据 ID（取自媒体头） |
+| `event_id` | `const char *` | turn id（借用）；无则为 `""` |
+| `timestamp_ms` | `uint64_t` | 流起始时间戳（媒体头） |
+
+:::note 流式接收
+接收到的图片以分片流形式到达：START（或 ONE_SHOT）携带首字节与 image-params，MIDDLE 继续，END 结束（len 可能为 0）。调用方按 `stream_flag` 累积分片，在流结束后（END 或 ONE_SHOT）解码整图。`format`/`width`/`height` 仅在 START/ONE_SHOT 从 image-params 解析得到，MIDDLE/END 时为 0。
+:::
 
 `tai_event_msg_t`（事件回调）：
 
@@ -390,7 +412,7 @@ void tai_request_disconnect(tai_ctx_t *ctx);
 int tai_send_text(tai_ctx_t *ctx, const char *text, size_t len);
 ```
 
-发送文本消息。单包完成（内部设置 `ONE_SHOT` 标志）。
+发送文本消息。一次调用内部依次发出 4 个应用包：`EventStart` → 文本（`ONE_SHOT` 标志）→ `EventPayloadsEnd` → `EventEnd`，调用方无需再手动收尾。
 
 **参数：**
 - `text` — UTF-8 文本
@@ -409,6 +431,10 @@ int tai_send_audio_start(tai_ctx_t *ctx,
 ```
 
 开始一段音频流。必须在 `tai_send_audio_chunk` 之前调用。
+
+:::note 云端 VAD 模式
+启用云端 VAD（Server VAD，连续对话）时，整个聊天会话只调用一次本函数，不要每个回合重复调用；上行音频流保持打开直到会话结束。详见 [VAD 与打断](../guides/vad-and-interrupt) 中的"云端 VAD vs 设备端 VAD"对比表。
+:::
 
 **参数：**
 - `codec` — 编码格式：`TAI_AUDIO_PCM`（101）或 `TAI_AUDIO_OPUS`（111）
@@ -439,6 +465,10 @@ int tai_send_audio_end(tai_ctx_t *ctx);
 ```
 
 结束音频流。通知服务端本次音频输入完毕，开始处理。
+
+:::warning 云端 VAD 模式下不要调用
+启用云端 VAD（`asr.enableVad`）时**不应**调用本函数。当前云端的回合结束信号是 `TAI_EVT_CHAT_BREAK`（`TAI_EVT_SERVER_VAD` 已不再下发），收到它也不要调用本函数。它仅用于手动按键对讲或设备端本地 VAD 判停。错误调用会主动结束当前上行 Event，导致云端截断用户语音。详见 [VAD 与打断](../guides/vad-and-interrupt)。
+:::
 
 ---
 
@@ -511,10 +541,10 @@ static inline int  tai_get_log_level(void);
 | 0 | 禁用所有日志 |
 | 1 | `TAI_LOG_ERROR` |
 | 2 | `TAI_LOG_WARN` |
-| 3 | `TAI_LOG_INFO` |
-| 4 | `TAI_LOG_DEBUG`（默认） |
+| 3 | `TAI_LOG_INFO`（运行时默认） |
+| 4 | `TAI_LOG_DEBUG` |
 
-编译时可通过定义 `TAI_LOG_LEVEL` 宏设置最大编译级别（超过的日志在编译期消除）。
+运行时默认级别为 `TAI_LOG_INFO`（3），需要 DEBUG 输出时显式调用 `tai_set_log_level(4)`。编译时可通过定义 `TAI_LOG_LEVEL` 宏设置最大编译级别（默认 4，超过的日志在编译期消除）。
 
 ---
 
@@ -538,6 +568,7 @@ tai_config_t cfg = {
     .pal              = &my_pal,
     .on_audio         = my_on_audio,
     .on_text          = my_on_text,
+    .on_image         = my_on_image,
     .on_event         = my_on_event,
     .on_disconnect    = my_on_disconnect,
 };
@@ -554,7 +585,7 @@ tai_send_audio_start(ctx, TAI_AUDIO_PCM, 1, 16, 16000);
 while (has_audio) {
     tai_send_audio_chunk(ctx, pcm_frame, frame_len);
 }
-tai_send_audio_end(ctx);
+tai_send_audio_end(ctx);   // 手动模式收尾；云端 VAD 模式下不要调用 audio_end
 
 // 6. 响应通过回调异步接收...
 
@@ -563,6 +594,8 @@ tai_disconnect(ctx);
 tai_ctx_deinit(ctx);
 free(mem);
 ```
+
+> 音频流的调用模式取决于 VAD 模式（云端 VAD 连续对话 vs 设备端 VAD/手动按键），详见 [VAD 与打断](../guides/vad-and-interrupt) 中的对比表。
 
 ---
 

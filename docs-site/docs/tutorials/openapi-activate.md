@@ -8,6 +8,10 @@ sidebar_position: 6
 
 > 对应示例：`examples/posix/pair/api-activate/`
 
+:::tip
+OpenAPI配网需要新建云项目并关联App，请先参考 [创建 App 和云项目](../guides/create-cloud-project.md) 完成云端配置。
+:::
+
 本章介绍第三种配网方式：**不依赖涂鸦 App，通过涂鸦 OpenAPI（Cloud API）在
 服务端完成用户创建和配网 Token 生成，再将 Token 传给设备完成激活**。
 
@@ -15,7 +19,6 @@ sidebar_position: 6
 设备厂商可能：
 
 - 拥有自己的 App 或后台系统，不希望依赖涂鸦 App
-- 需要在生产线上批量激活设备
 - 设备没有屏幕也没有摄像头
 
 此时可以通过涂鸦 OpenAPI 直接在服务端完成用户同步和配网 Token 的生成，然后
@@ -67,6 +70,31 @@ sidebar_position: 6
 ### 3. 查询配网结果 — `GET /v1.0/device/paring/tokens/{token}`
 
 查询设备是否已通过该 Token 完成激活。
+
+### 4. 设备解绑（移除设备） — `DELETE /v2.0/cloud/thing/{device_id}`
+
+根据设备 ID 从云端移除设备，即**解绑**。解绑后设备与原用户的绑定关系被
+清除，设备需要重新走配网激活流程才能再次使用。
+
+| 参数 | 类型 | 位置 | 必填 | 说明 |
+|------|------|------|------|------|
+| `device_id` | string | path | 是 | 设备 ID |
+
+返回示例：
+
+```json
+{
+    "tid": "b8a2b49abbbc11eda71e169efc83a172",
+    "result": true,
+    "t": 1678065474602,
+    "success": true
+}
+```
+
+设备端收到云端下发的解绑/重置通知后，应清除本地保存的激活信息（uuid、
+authkey 等），重新进入待配网状态。
+
+> 参考文档：[移除设备](https://developer.tuya.com/cn/docs/cloud/f20e091c7d?id=Kcp2l28fs16or)
 
 ## Token 格式
 
@@ -121,7 +149,7 @@ python3 ./build/tuya_openapi.py pairing-token --uid "ay..." --paring-type BLE \
 
 ## 注意事项
 
-- 配网 Token 有有效期（通常 100 秒），需在有效期内完成设备激活。
+- 配网 Token 有有效期，需在有效期内完成设备激活；可用 `tuya_openapi.py pairing-result --poll` 轮询确认结果（`--timeout` 默认 100 秒）。
 - `tuya_openapi.py` 使用 Python 标准库实现，无需安装额外依赖。
 - 实际产品中，OpenAPI 调用应在厂商自己的后台服务中完成，**不应将 Access
   Secret 暴露在客户端或设备端**。

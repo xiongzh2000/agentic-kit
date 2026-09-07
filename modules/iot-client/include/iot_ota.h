@@ -45,19 +45,20 @@
 /**
  * @brief OTA upgrade status codes.
  *
- * These map to the Tuya cloud's upgrade status values:
- * - 0: idle / pending
- * - 1: upgrade in progress
- * - 2: upgrade finished successfully
- * - 3: upgrade failed / abnormal
- * - 4: upgrade aborted
+ * These map to the Tuya cloud's server-side `FirmwareUpgradeStatus`
+ * definition:
+ * - 0: default, no upgrade needed
+ * - 1: ready (upgrade task issued, device prepared)
+ * - 2: upgrade in progress
+ * - 3: upgrade complete
+ * - 4: upgrade error / abnormal
  */
 typedef enum {
-    OTA_STATUS_IDLE        = 0,
-    OTA_STATUS_UPGRADING   = 1,
-    OTA_STATUS_UPGRAD_FINI = 2,
-    OTA_STATUS_UPGRD_EXEC  = 3,
-    OTA_STATUS_UPGRD_ABORT = 4,
+    OTA_STATUS_IDLE      = 0,
+    OTA_STATUS_READY     = 1,
+    OTA_STATUS_UPGRADING = 2,
+    OTA_STATUS_COMPLETE  = 3,
+    OTA_STATUS_ERROR     = 4,
 } iot_ota_status_t;
 
 /**
@@ -97,14 +98,11 @@ OTA_API int iot_ota_report_version(iot_client_t *client, const char *sw_ver);
  *
  * @param[in]  client   IoT client instance (must be initialized)
  * @param[in]  channel  Firmware channel (0 = main MCU firmware)
- * @param[in]  sw_ver   Current firmware version string sent to cloud for
- *                      comparison (e.g. "1.0.0"); pass NULL to omit
  * @param[out] info     Output: upgrade info (caller must free with
  *                      iot_ota_upgrade_info_free())
  * @return OPRT_OK on success (including no-upgrade case), error code on failure
  */
 OTA_API int iot_ota_check_upgrade(iot_client_t *client, int channel,
-                                  const char *sw_ver,
                                   iot_ota_upgrade_info_t *info);
 
 /**
@@ -113,8 +111,8 @@ OTA_API int iot_ota_check_upgrade(iot_client_t *client, int channel,
  * Sends the `tuya.device.upgrade.status.update` ATOP API. Call this to notify
  * the cloud of the upgrade lifecycle:
  * - OTA_STATUS_UPGRADING before starting the download/flash.
- * - OTA_STATUS_UPGRAD_FINI after a successful upgrade (typically after reboot).
- * - OTA_STATUS_UPGRD_EXEC on failure.
+ * - OTA_STATUS_COMPLETE after a successful upgrade (typically after reboot).
+ * - OTA_STATUS_ERROR on failure.
  *
  * @param client   IoT client instance (must be initialized)
  * @param channel  Firmware channel (0 = main MCU firmware)
@@ -133,5 +131,79 @@ OTA_API int iot_ota_report_status(iot_client_t *client, int channel,
  * @param info    Upgrade info to free (fields zeroed after free)
  */
 OTA_API void iot_ota_upgrade_info_free(iot_client_t *client, iot_ota_upgrade_info_t *info);
+
+/* ============================================================================
+ * Firmware digest verification (MD5 / HMAC-SHA256)
+ * ============================================================================ */
+
+/** Opaque streaming digest context (allocated by iot_ota_verify_init). */
+typedef struct iot_ota_verify_ctx iot_ota_verify_ctx_t;
+
+/**
+ * @brief Start verifying a firmware image against the cloud digest.
+ *
+ * Algorithm selection (following TuyaOpen tuya_ota.c):
+ * - If @p info->hmac is a non-empty string: expected value is
+ *   HMAC-SHA256(key = client->secret_key,
+ *               msg = UPPERCASE_hex(SHA-256(firmware))) as 64 hex chars.
+ * - Else if @p info->md5 is a non-empty string: expected value is
+ *   MD5(firmware) as 32 hex chars.
+ * - Else: OPRT_NOT_SUPPORTED (nothing to verify against). The cloud sends ""
+ *   for a digest it has not configured, so an empty string counts as absent
+ *   and falls through to the next algorithm.
+ *
+ * A non-empty digest of the wrong length is OPRT_INVALID_PARAMETER, never a
+ * silent downgrade to the weaker algorithm.
+ *
+ * On any error return, @p ctx_out is not written — initialize it to NULL
+ * before the call. The returned context borrows client->pal: call
+ * iot_ota_verify_finish() or iot_ota_verify_abort() before
+ * iot_client_deinit().
+ *
+ * @param[in]  client   IoT client instance (provides secret_key + allocator)
+ * @param[in]  info     Upgrade info returned by iot_ota_check_upgrade()
+ * @param[out] ctx_out  Initialized verification context
+ * @return OPRT_OK on success, OPRT_NOT_SUPPORTED if neither digest is present
+ *         (absent or empty), OPRT_INVALID_PARAMETER on bad args or on a
+ *         non-empty digest of the wrong length
+ */
+OTA_API int iot_ota_verify_init(iot_client_t *client,
+                                const iot_ota_upgrade_info_t *info,
+                                iot_ota_verify_ctx_t **ctx_out);
+
+/**
+ * @brief Feed a firmware chunk into the digest.
+ *
+ * Call for every chunk in download order; the chunk order and boundaries do
+ * not affect the result.
+ *
+ * @param ctx  Verification context
+ * @param data Firmware bytes
+ * @param len  Number of bytes
+ * @return OPRT_OK on success, error code on failure
+ */
+OTA_API int iot_ota_verify_update(iot_ota_verify_ctx_t *ctx,
+                                  const uint8_t *data, size_t len);
+
+/**
+ * @brief Finish verification and free the context.
+ *
+ * The context is freed on every path (success or failure); do not use it
+ * again after this call.
+ *
+ * @param ctx Verification context
+ * @return OPRT_OK if the digest matches, OPRT_OTA_VERIFY_FAILED on mismatch,
+ *         error code on internal failure
+ */
+OTA_API int iot_ota_verify_finish(iot_ota_verify_ctx_t *ctx);
+
+/**
+ * @brief Free a verification context without checking the digest.
+ *
+ * For download-failure paths where verification will never complete.
+ *
+ * @param ctx Verification context (NULL is a safe no-op)
+ */
+OTA_API void iot_ota_verify_abort(iot_ota_verify_ctx_t *ctx);
 
 #endif /* _IOT_OTA_H_ */

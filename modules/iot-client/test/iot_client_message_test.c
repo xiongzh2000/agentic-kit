@@ -96,6 +96,24 @@ static void test_message_callback(const char *topic, size_t topic_len,
            cb_topic, cb_data_len, (int)cb_data_len, cb_data);
 }
 
+static volatile int ota_confirm_cb_called = 0;
+static int ota_confirm_cb_channel = -1;
+static void *ota_confirm_cb_user_data = NULL;
+
+static void test_ota_confirm_callback(int channel, void *user_data)
+{
+    ota_confirm_cb_called++;
+    ota_confirm_cb_channel = channel;
+    ota_confirm_cb_user_data = user_data;
+}
+
+static void reset_ota_confirm_callback_state(void)
+{
+    ota_confirm_cb_called = 0;
+    ota_confirm_cb_channel = -1;
+    ota_confirm_cb_user_data = NULL;
+}
+
 static int wait_for_port(int port)
 {
     for (int i = 0; i < 50; i++) {
@@ -424,16 +442,16 @@ static int test_encrypted_message(void)
     return result;
 }
 
-/* ---------- Test 5: iot_client_init with mqtt_auto_connect=true must short-circuit when no mqtt_url ---------- */
+/* ---------- Test 5: auto-connect (the default) must short-circuit when there is no mqtt_url ---------- */
 
 static int test_iot_client_init_autoconnect_no_url(void)
 {
     /* Empty devid skips DNS resolution, so mqtt_url stays NULL. The new
-     * auto-connect branch (`client->mqtt_url && config->mqtt_auto_connect`)
+     * auto-connect branch (`client->mqtt_url && !config->mqtt_disable_auto_connect`)
      * must safely short-circuit — returning a usable, disconnected client
      * instead of crashing or attempting a connect with NULL URL. */
     iot_client_config_t cfg = {0};
-    cfg.mqtt_auto_connect = true;
+    /* Nothing set: auto-connect is the default. */
 
     iot_client_t *client = iot_client_init(&cfg);
     if (!client) {
@@ -454,12 +472,12 @@ static int test_iot_client_init_autoconnect_no_url(void)
     return result;
 }
 
-/* ---------- Test 6: iot_client_init with mqtt_auto_connect=false also stays disconnected ---------- */
+/* ---------- Test 6: iot_client_init with auto-connect disabled also stays disconnected ---------- */
 
 static int test_iot_client_init_no_autoconnect(void)
 {
     iot_client_config_t cfg = {0};
-    cfg.mqtt_auto_connect = false;
+    cfg.mqtt_disable_auto_connect = true;
 
     iot_client_t *client = iot_client_init(&cfg);
     if (!client) {
@@ -474,6 +492,392 @@ static int test_iot_client_init_no_autoconnect(void)
     }
     iot_client_deinit(client);
     return result;
+}
+
+/* [7] init copies the APP-confirmed OTA callback and its user data */
+static int test_iot_client_init_copies_ota_confirm_config(void)
+{
+    static char user_data;
+    iot_client_config_t cfg = {0};
+    cfg.ota_confirm_callback = test_ota_confirm_callback;
+    cfg.ota_confirm_user_data = &user_data;
+
+    iot_client_t *client = iot_client_init(&cfg);
+    if (!client) {
+        printf("  iot_client_init returned NULL\n");
+        return -1;
+    }
+
+    int result = 0;
+    if (client->ota_confirm_callback != test_ota_confirm_callback) {
+        printf("  ota_confirm_callback was not copied\n");
+        result = -1;
+    }
+    if (client->ota_confirm_user_data != &user_data) {
+        printf("  ota_confirm_user_data was not copied\n");
+        result = -1;
+    }
+    iot_client_deinit(client);
+    return result;
+}
+
+/* [8] the public connect/disconnect wrappers reach the message layer.
+ *
+ * They exist because iot_client_message_connect() lives in a src-private
+ * header: with mqtt_disable_auto_connect set, an app built against the
+ * installed headers had no way to bring the link up, and no way to
+ * re-establish a dropped one -- while iot_client.h's own config comment told
+ * it to call exactly that function. A NULL-client check alone would pass
+ * against an empty stub too, so the forwarding is pinned on a verdict only
+ * the callee reaches: the missing mqtt_url/devid rejection. */
+static int test_public_connect_wrappers_forward(void)
+{
+    int result = 0;
+
+    if (iot_client_connect(NULL) != OPRT_INVALID_PARAMETER) {
+        printf("  iot_client_connect(NULL) must return OPRT_INVALID_PARAMETER\n");
+        result = -1;
+    }
+    iot_client_disconnect(NULL);   /* must be a safe no-op, per the header */
+
+    /* Empty devid skips DNS, so mqtt_url stays unset. That state is rejected
+     * only inside iot_client_message_connect(), and without ever opening a
+     * socket -- so the verdict below proves the call was forwarded. */
+    iot_client_config_t cfg = {0};
+    cfg.mqtt_disable_auto_connect = true;
+    iot_client_t *client = iot_client_init(&cfg);
+    if (!client) {
+        printf("  iot_client_init returned NULL\n");
+        return -1;
+    }
+
+    if (iot_client_connect(client) != OPRT_INVALID_PARAMETER) {
+        printf("  connect on a client with no mqtt_url/devid should be rejected\n");
+        result = -1;
+    }
+    if (iot_client_connect(client) != iot_client_message_connect(client)) {
+        printf("  public wrapper disagrees with the private entry point\n");
+        result = -1;
+    }
+
+    /* Never-connected client, disconnected twice: no-op both times. */
+    iot_client_disconnect(client);
+    iot_client_disconnect(client);
+    if (client->mqtt != NULL) {
+        printf("  expected mqtt=NULL after disconnect on an unconnected client\n");
+        result = -1;
+    }
+
+    iot_client_deinit(client);
+    return result;
+}
+
+/* [9] connect on an already-connected client must not build a second link.
+ *
+ * iot_client_message_try_connect() assigns client->mqtt unconditionally, so a
+ * second pass overwrites the handle and leaks the previous mqtt client, its
+ * packet buffer and its open socket -- with nothing left pointing at them. Easy
+ * to reach now that iot_client_connect() is public and documented as the way to
+ * bring the link up: an app that also left auto-connect enabled calls it on a
+ * client that is already connected.
+ *
+ * Asserting the handle is unchanged is what pins it; the leak itself shows up
+ * under test/run_leaks_check.sh. */
+static int test_connect_twice_keeps_one_link(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *client = (iot_client_t *)pal->malloc(sizeof(iot_client_t));
+    if (!client) return -1;
+    memset(client, 0, sizeof(iot_client_t));
+    client->pal = pal;
+    strncpy((char *)client->devid, TEST_DEVID, sizeof(client->devid) - 1);
+    strncpy((char *)client->secret_key, TEST_SECRET_KEY, sizeof(client->secret_key) - 1);
+    strncpy((char *)client->local_key, TEST_LOCAL_KEY, sizeof(client->local_key) - 1);
+    snprintf(client->mqtt_url, sizeof(client->mqtt_url), "%s", TEST_MQTT_URL);
+    client->cacert = g_cacert;
+
+    int result = 0;
+    if (iot_client_connect(client) != OPRT_OK) {
+        printf("  first connect failed\n");
+        pal->free(client);
+        return -1;
+    }
+    void *first = client->mqtt;
+    if (first == NULL) {
+        printf("  connect reported success but left mqtt NULL\n");
+        result = -1;
+    }
+
+    /* Second call: success, and the same link. */
+    if (iot_client_connect(client) != OPRT_OK) {
+        printf("  second connect should report OPRT_OK (already connected)\n");
+        result = -1;
+    }
+    if (client->mqtt != first) {
+        printf("  second connect replaced the mqtt handle -- the first one leaked\n");
+        result = -1;
+    }
+
+    iot_client_disconnect(client);
+    if (client->mqtt != NULL) {
+        printf("  disconnect left mqtt non-NULL\n");
+        result = -1;
+    }
+    client->mqtt_url[0] = '\0';
+    pal->free(client);
+    return result;
+}
+
+/* ---------- Reset callback tests (network-free, plaintext input) ---------- */
+
+static volatile int reset_cb_called = 0;
+static int reset_cb_type = -1;   /* int, not iot_reset_type_t: -1 sentinel + %d printing */
+
+static void test_reset_callback(iot_reset_type_t type, void *user_data)
+{
+    (void)user_data;
+    reset_cb_called++;
+    reset_cb_type = type;
+}
+
+static iot_client_t *make_bare_client(const pal_t *pal, const char *devid)
+{
+    iot_client_t *client = (iot_client_t *)pal->malloc(sizeof(iot_client_t));
+    if (!client) return NULL;
+    memset(client, 0, sizeof(iot_client_t));
+    client->pal = pal;
+    if (devid) strncpy(client->devid, devid, sizeof(client->devid) - 1);
+    return client;
+}
+
+/* [7] protocol 11 without "type" → UNBIND, consumed */
+static int test_reset_unbind(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_cb_called = 0;
+    reset_cb_type = -1;
+    c->reset_callback = test_reset_callback;
+
+    const char *json = "{\"protocol\":11,\"t\":1700000000,\"data\":{\"gwId\":\"test_device_msg_001\"}}";
+    if (!iot_client_message_handle_reset(c, (const uint8_t *)json, strlen(json))) {
+        printf("  protocol 11 not consumed\n"); goto out;
+    }
+    if (reset_cb_called != 1) { printf("  callback not fired (%d)\n", reset_cb_called); goto out; }
+    if (reset_cb_type != IOT_RESET_REMOTE_UNBIND) { printf("  expected UNBIND, got %d\n", reset_cb_type); goto out; }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+/* [8] protocol 11 with root "type":"reset_factory" → FACTORY */
+static int test_reset_factory(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_cb_called = 0;
+    reset_cb_type = -1;
+    c->reset_callback = test_reset_callback;
+
+    const char *json = "{\"protocol\":11,\"t\":1700000000,\"type\":\"reset_factory\",\"data\":{\"gwId\":\"test_device_msg_001\"}}";
+    if (!iot_client_message_handle_reset(c, (const uint8_t *)json, strlen(json))) {
+        printf("  protocol 11 factory not consumed\n"); goto out;
+    }
+    if (reset_cb_called != 1) { printf("  callback not fired\n"); goto out; }
+    if (reset_cb_type != IOT_RESET_REMOTE_FACTORY) { printf("  expected FACTORY, got %d\n", reset_cb_type); goto out; }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+/* [9] foreign gwId → consumed, callback NOT fired */
+static int test_reset_foreign_gwid(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_cb_called = 0;
+    reset_cb_type = -1;
+    c->reset_callback = test_reset_callback;
+
+    const char *json = "{\"protocol\":11,\"data\":{\"gwId\":\"some_other_device\"}}";
+    if (!iot_client_message_handle_reset(c, (const uint8_t *)json, strlen(json))) {
+        printf("  foreign gwId not consumed\n"); goto out;
+    }
+    if (reset_cb_called != 0) { printf("  callback should not fire for foreign gwId\n"); goto out; }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+/* [10] non-11 protocols / garbage → passthrough (returns false) */
+static int test_reset_passthrough(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_cb_called = 0;
+    c->reset_callback = test_reset_callback;
+
+    /* protocol 5 (DP set) */
+    static const char dp_json[] = "{\"protocol\":5,\"data\":{\"dps\":{\"1\":true}}}";
+    if (iot_client_message_handle_reset(c, (const uint8_t *)dp_json, sizeof(dp_json) - 1)) {
+        printf("  protocol 5 consumed\n"); goto out;
+    }
+    /* no protocol field */
+    static const char no_proto_json[] = "{\"type\":\"test\"}";
+    if (iot_client_message_handle_reset(c, (const uint8_t *)no_proto_json, sizeof(no_proto_json) - 1)) {
+        printf("  no-protocol consumed\n"); goto out;
+    }
+    /* garbage */
+    static const char garbage[] = "not json";
+    if (iot_client_message_handle_reset(c, (const uint8_t *)garbage, sizeof(garbage) - 1)) {
+        printf("  garbage consumed\n"); goto out;
+    }
+    if (reset_cb_called != 0) {
+        printf("  callback fired on passthrough (%d)\n", reset_cb_called); goto out;
+    }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+/* [11] protocol 11 with no callback registered → passthrough (opt-in gate) */
+static int test_reset_no_callback_passthrough(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    /* reset_callback is NULL (memset to 0) */
+
+    const char *json = "{\"protocol\":11,\"data\":{\"gwId\":\"test_device_msg_001\"}}";
+    if (iot_client_message_handle_reset(c, (const uint8_t *)json, strlen(json))) {
+        printf("  protocol 11 consumed without a registered callback\n"); goto out;
+    }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+/* ---------- APP-confirmed OTA callback tests (network-free, plaintext) ---------- */
+
+static int test_ota_confirm_channel_from_firmware_type(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    static char user_data;
+    reset_ota_confirm_callback_state();
+    c->ota_confirm_callback = test_ota_confirm_callback;
+    c->ota_confirm_user_data = &user_data;
+
+    const char *json = "{\"protocol\":15,\"t\":1700000000,\"data\":{\"firmwareType\":5}}";
+    if (!iot_client_message_handle_ota_confirm(c, (const uint8_t *)json, strlen(json))) {
+        printf("  protocol 15 not consumed\n"); goto out;
+    }
+    if (ota_confirm_cb_called != 1) {
+        printf("  callback not fired (%d)\n", ota_confirm_cb_called); goto out;
+    }
+    if (ota_confirm_cb_channel != 5) {
+        printf("  expected channel 5, got %d\n", ota_confirm_cb_channel); goto out;
+    }
+    if (ota_confirm_cb_user_data != &user_data) {
+        printf("  callback user_data mismatch\n"); goto out;
+    }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+static int test_ota_confirm_missing_or_invalid_firmware_type_defaults_to_main(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_ota_confirm_callback_state();
+    c->ota_confirm_callback = test_ota_confirm_callback;
+
+    const char *json = "{\"protocol\":15,\"t\":1700000000}";
+    if (!iot_client_message_handle_ota_confirm(c, (const uint8_t *)json, strlen(json))) {
+        printf("  protocol 15 without firmwareType not consumed\n"); goto out;
+    }
+    if (ota_confirm_cb_called != 1 || ota_confirm_cb_channel != 0) {
+        printf("  callback result: called=%d channel=%d (expected 1/0)\n",
+               ota_confirm_cb_called, ota_confirm_cb_channel); goto out;
+    }
+
+    reset_ota_confirm_callback_state();
+    const char *invalid_type_json = "{\"protocol\":15,\"data\":{\"firmwareType\":\"5\"}}";
+    if (!iot_client_message_handle_ota_confirm(c, (const uint8_t *)invalid_type_json, strlen(invalid_type_json))) {
+        printf("  protocol 15 with malformed firmwareType not consumed\n"); goto out;
+    }
+    if (ota_confirm_cb_called != 1 || ota_confirm_cb_channel != 0) {
+        printf("  malformed firmwareType result: called=%d channel=%d (expected 1/0)\n",
+               ota_confirm_cb_called, ota_confirm_cb_channel); goto out;
+    }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+static int test_ota_confirm_no_callback_passthrough(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_ota_confirm_callback_state();
+
+    const char *json = "{\"protocol\":15,\"data\":{\"firmwareType\":5}}";
+    if (iot_client_message_handle_ota_confirm(c, (const uint8_t *)json, strlen(json))) {
+        printf("  protocol 15 consumed without a registered callback\n"); goto out;
+    }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
+}
+
+static int test_ota_confirm_non_matching_payloads_passthrough(void)
+{
+    const pal_t *pal = get_default_pal();
+    iot_client_t *c = make_bare_client(pal, TEST_DEVID);
+    if (!c) { printf("  alloc failed\n"); return -1; }
+    int rc = -1;
+    reset_ota_confirm_callback_state();
+    c->ota_confirm_callback = test_ota_confirm_callback;
+
+    static const char dp_json[] = "{\"protocol\":5,\"data\":{\"dps\":{\"1\":true}}}";
+    static const char no_proto_json[] = "{\"data\":{\"firmwareType\":5}}";
+    static const char garbage[] = "not json";
+    if (iot_client_message_handle_ota_confirm(c, (const uint8_t *)dp_json, sizeof(dp_json) - 1) ||
+        iot_client_message_handle_ota_confirm(c, (const uint8_t *)no_proto_json, sizeof(no_proto_json) - 1) ||
+        iot_client_message_handle_ota_confirm(c, (const uint8_t *)garbage, sizeof(garbage) - 1)) {
+        printf("  a non-protocol-15 payload was consumed\n"); goto out;
+    }
+    if (ota_confirm_cb_called != 0) {
+        printf("  callback fired on passthrough (%d)\n", ota_confirm_cb_called); goto out;
+    }
+    rc = 0;
+out:
+    pal->free(c);
+    return rc;
 }
 
 /* ---------- main ---------- */
@@ -517,9 +921,25 @@ int main(void)
     RUN_TEST(test_invalid_format_message);
     RUN_TEST(test_decrypt_fail_wrong_key);
 
-    /* iot_client_init + mqtt_auto_connect (no mocks needed: empty devid skips DNS) */
+    /* iot_client_init + auto-connect (no mocks needed: empty devid skips DNS) */
     RUN_TEST(test_iot_client_init_autoconnect_no_url);
     RUN_TEST(test_iot_client_init_no_autoconnect);
+    RUN_TEST(test_iot_client_init_copies_ota_confirm_config);
+    RUN_TEST(test_public_connect_wrappers_forward);
+    RUN_TEST(test_connect_twice_keeps_one_link);
+
+    /* Reset callback tests (network-free, no mocks needed) */
+    RUN_TEST(test_reset_unbind);
+    RUN_TEST(test_reset_factory);
+    RUN_TEST(test_reset_foreign_gwid);
+    RUN_TEST(test_reset_passthrough);
+    RUN_TEST(test_reset_no_callback_passthrough);
+
+    /* APP-confirmed OTA callback tests (network-free, no mocks needed) */
+    RUN_TEST(test_ota_confirm_channel_from_firmware_type);
+    RUN_TEST(test_ota_confirm_missing_or_invalid_firmware_type_defaults_to_main);
+    RUN_TEST(test_ota_confirm_no_callback_passthrough);
+    RUN_TEST(test_ota_confirm_non_matching_payloads_passthrough);
 
     stop_mock_wrongkey();
     stop_mock_invalid();

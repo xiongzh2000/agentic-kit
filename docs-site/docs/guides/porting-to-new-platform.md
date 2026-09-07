@@ -106,7 +106,7 @@ tai_config_t cfg = {
 | 互斥锁 | `xSemaphoreCreateRecursiveMutex` |
 | 时间 | `xTaskGetTickCount() * portTICK_PERIOD_MS` |
 
-> **注意：** `pal.h:91` 要求 `mutex_create` 返回**递归锁**，因此必须使用 `xSemaphoreCreateRecursiveMutex`（配合 `xSemaphoreTakeRecursive` / `xSemaphoreGiveRecursive`），不能用非递归的 `xSemaphoreCreateMutex`，否则会在重入加锁路径上死锁。
+> **注意：** `pal.h` 的 `mutex_create` 契约（见头文件注释）要求返回**递归锁**，因此必须使用 `xSemaphoreCreateRecursiveMutex`（配合 `xSemaphoreTakeRecursive` / `xSemaphoreGiveRecursive`），不能用非递归的 `xSemaphoreCreateMutex`，否则会在重入加锁路径上死锁。
 
 TCP 部分取决于具体的网络协议栈（lwIP、AT 指令等）。
 
@@ -116,7 +116,7 @@ TCP 部分取决于具体的网络协议栈（lwIP、AT 指令等）。
 
 | 组件 | 内存需求 | 建议分配位置 |
 |------|---------|-------------|
-| `tai_ctx_size()` | 依赖编译期缓冲配置，默认可达数百 KB | 若平台支持，可优先考虑大块外部内存（如 ESP32-S3 PSRAM） |
+| `tai_ctx_size()` | 依赖编译期缓冲配置，默认约 38 KB（调大 `TAI_FRAG_BUF_SIZE` 等缓冲后会相应增长） | 若平台支持，可优先考虑大块外部内存（如 ESP32-S3 PSRAM） |
 | TLS 工作区 | ~30 KB | PSRAM |
 | 音频发送缓冲 | ~4-8 KB | 内部 SRAM |
 | 音频接收缓冲 | ~8-16 KB | 内部 SRAM 或 PSRAM |
@@ -146,7 +146,7 @@ CONFIG_FREERTOS_HZ=1000
 
 ## 通用注意事项
 
-- PAL `thread_create` 需要设置足够的栈大小；`pal_freertos.c` 默认使用 `PAL_FR_TASK_STACK_WORDS`（约 6KB，可按平台内存情况调小或调大）
+- PAL `thread_create` 需要设置足够的栈大小；`pal_freertos.c` 默认使用 `PAL_FR_TASK_STACK_WORDS`（6144 words，32 位平台上约 24KB，可按平台内存情况调小或调大）
 - SDK 内部通过 mbedTLS 处理 TLS，需要正确的系统时间用于证书验证；若未提供 CA 证书，TLS 连接可能退化为不校验证书的模式
 - `tcp_recv` 应支持阻塞/超时语义（后台线程会循环调用）
 - `tcp_poll` 用于检查套接字的可读/可写状态，需正确实现 events 位掩码

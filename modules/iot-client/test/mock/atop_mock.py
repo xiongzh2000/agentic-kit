@@ -271,6 +271,18 @@ def handle_ai_token_request(request_data, config):
 
         agent_code = request_json.get('agentCode', '')
 
+        # Test-only: an agentCode of "reject:<CODE>" makes the cloud reject the
+        # request with that errorCode, so the caller's handling of the real
+        # rejections (unbound device, unsigned privacy agreement, no agent
+        # configured) can be tested. Real agent codes never contain a colon.
+        if agent_code.startswith('reject:'):
+            return json.dumps({
+                "success": False,
+                "t": int(time.time()),
+                "errorCode": agent_code[len('reject:'):],
+                "errorMsg": "mock rejection"
+            }, separators=(',', ':'))
+
         device_id = config.get('device_id', 'device')
         response = {
             "success": True,
@@ -344,6 +356,94 @@ def handle_device_meta_save_request(request_data, config):
         return json.dumps(response, separators=(',', ':'))
 
 
+def handle_device_reset(request_data, config, url_params=None):
+    """Handle device reset / unbind (tuya.device.reset).
+
+    Success mirrors the interface doc exactly: an EMPTY result object. That is
+    the point of this handler -- a wrapper that insisted on a non-empty result
+    would reject a real success.
+
+    A devId containing 'busy' answers with the doc's own retryable rejection,
+    so a test can reach the "failure must leave the client intact" path. The
+    mock decrypts with sec_key regardless of which devId is presented, so a
+    test only has to vary the devid string.
+    """
+    try:
+        body = json.loads(request_data)
+    except Exception as e:
+        print(f"\u274c device reset: unparsable body: {e}", file=sys.stderr)
+        return json.dumps({
+            "success": False,
+            "t": int(time.time()),
+            "errorCode": "ILLEGAL_PARAM",
+            "errorMsg": str(e)
+        }, separators=(',', ':'))
+
+    # resetFactory is required, and both values are legal: false unbinds, true
+    # also wipes the device's cloud-side data. Pin its PRESENCE (omitting it
+    # would come back from the real cloud as an opaque rejection -- the same
+    # class of late failure as a wrong version below) and echo it back, so a
+    # test can prove the caller's choice actually reached the wire.
+    reset_factory = body.get('resetFactory')
+    if not isinstance(reset_factory, bool):
+        print(f"\u274c device reset: resetFactory missing or not a bool: {body!r}",
+              file=sys.stderr)
+        return json.dumps({
+            "success": False,
+            "t": int(time.time()),
+            "errorCode": "ILLEGAL_PARAM",
+            "errorMsg": "tuya.device.reset expects a boolean resetFactory"
+        }, separators=(',', ':'))
+    print(f"   resetFactory: {reset_factory}")
+
+    # The caller's scope has to reach the wire, and an empty-result response
+    # cannot show which one arrived. Encode the expectation in the devId
+    # instead: a devId containing 'factory' must present resetFactory=true, any
+    # other must present false. A test that sends the wrong scope is then
+    # rejected here rather than passing silently -- and the success response
+    # keeps the empty result the real interface returns.
+    devid_for_scope = (url_params or {}).get('devId', '')
+    expect_factory = 'factory' in devid_for_scope
+    if reset_factory is not expect_factory:
+        print(f"\u274c device reset: devId {devid_for_scope!r} expects "
+              f"resetFactory={expect_factory}, got {reset_factory}", file=sys.stderr)
+        return json.dumps({
+            "success": False,
+            "t": int(time.time()),
+            "errorCode": "ILLEGAL_PARAM",
+            "errorMsg": f"expected resetFactory={str(expect_factory).lower()}"
+        }, separators=(',', ':'))
+
+    # Pin the interface version. It is the one thing about this call that a
+    # local test cannot otherwise check: on a real device a wrong version comes
+    # back as an opaque cloud rejection, which reads like a network fault.
+    version = (url_params or {}).get('v', '')
+    if version != '5.0':
+        print(f"\u274c device reset: wrong interface version {version!r} (expected '5.0')",
+              file=sys.stderr)
+        return json.dumps({
+            "success": False,
+            "t": int(time.time()),
+            "errorCode": "UNKNOWN_API_VERSION",
+            "errorMsg": f"tuya.device.reset expects v=5.0, got {version!r}"
+        }, separators=(',', ':'))
+
+    devid = (url_params or {}).get('devId', '')
+    if 'busy' in devid:
+        return json.dumps({
+            "success": False,
+            "t": int(time.time()),
+            "errorCode": "REMOTE_API_RUN_UNKNOW_FAILED",
+            "errorMsg": "The server is busy, please try again later"
+        }, separators=(',', ':'))
+
+    return json.dumps({
+        "success": True,
+        "t": int(time.time()),
+        "result": {}
+    }, separators=(',', ':'))
+
+
 def handle_schema_newest_get(request_data, config):
     """Handle newest-schema query (tuya.device.schema.newest.get).
 
@@ -399,8 +499,8 @@ def handle_upgrade_get(request_data, config):
                 "cdnUrl": "https://images.example.com/firmware/v2.0.0.bin",
                 "httpsUrl": "https://fireware.example.com:1443/firmware/v2.0.0.bin",
                 "size": "1024000",
-                "md5": "aabbccdd11223344",
-                "hmac": "eeff00112233445566778899aabbccdd"
+                "md5": "aabbccdd11223344aabbccdd11223344",
+                "hmac": "eeff00112233445566778899aabbccddeeff00112233445566778899aabbccdd"
             }
 
         response = {
@@ -555,21 +655,13 @@ class ATOPMockHandler(BaseHTTPRequestHandler):
             # Determine encryption key
             # For activation: use authkey from config
             # For AI config: use sec_key from config (or devid's key)
-            if api == 'thing.device.opensdk.active':
-                key = self.config.get('authkey', '').encode('utf-8')
-            elif api == 'thing.ai.agent.token.get':
-                key = self.config.get('sec_key', '').encode('utf-8')
-            elif api == 'tuya.device.qrcode.info.get':
-                key = self.config.get('authkey', '').encode('utf-8')
-            elif api == 'tuya.device.meta.save':
-                key = self.config.get('sec_key', '').encode('utf-8')
-            elif api == 'tuya.device.schema.newest.get':
-                key = self.config.get('sec_key', '').encode('utf-8')
-            elif api == 'tuya.device.upgrade.get':
-                key = self.config.get('sec_key', '').encode('utf-8')
-            elif api == 'tuya.device.versions.update':
-                key = self.config.get('sec_key', '').encode('utf-8')
-            elif api == 'tuya.device.upgrade.status.update':
+            # Key selection follows the credential the device signs with, keyed
+            # purely off the identity param in the URL: a devId means the caller
+            # is an activated device signing with sec_key; otherwise (uuid-only,
+            # i.e. pre-activation) it signs with authkey. No per-API list -- that
+            # is what lets the generic entry point reach interfaces the mock has
+            # no handler for, including ones the named wrappers also cover.
+            if devid:
                 key = self.config.get('sec_key', '').encode('utf-8')
             else:
                 key = self.config.get('authkey', '').encode('utf-8')
@@ -607,6 +699,8 @@ class ATOPMockHandler(BaseHTTPRequestHandler):
                 response_json = handle_qrcode_info_request(decrypted_data, self.config, url_params)
             elif api == 'tuya.device.meta.save':
                 response_json = handle_device_meta_save_request(decrypted_data, self.config)
+            elif api == 'tuya.device.reset':
+                response_json = handle_device_reset(decrypted_data, self.config, url_params)
             elif api == 'tuya.device.schema.newest.get':
                 response_json = handle_schema_newest_get(decrypted_data, self.config)
             elif api == 'tuya.device.upgrade.get':
@@ -615,6 +709,35 @@ class ATOPMockHandler(BaseHTTPRequestHandler):
                 response_json = handle_version_update(decrypted_data, self.config)
             elif api == 'tuya.device.upgrade.status.update':
                 response_json = handle_upgrade_status_update(decrypted_data, self.config)
+            elif api == 'tuya.test.huge.result':
+                # Test-only: a response deliberately larger than the default
+                # 4096-byte RESPONSE_BUFFER_SIZE, reproducing the real failure
+                # recorded in CHANGELOG (a product whose schema came back at
+                # contentLength 6558). coreHTTP answers HTTPInsufficientMemory;
+                # the point of the test is that it now SAYS so.
+                response_json = json.dumps({
+                    "success": True,
+                    "t": int(time.time()),
+                    "result": {"blob": "x" * 6000}
+                }, separators=(',', ':'))
+            elif api == 'tuya.test.result.null':
+                # Test-only: a success envelope whose result is JSON null --
+                # the generic entry must hand this back as NULL, not "null".
+                response_json = json.dumps({
+                    "success": True,
+                    "t": int(time.time()),
+                    "result": None
+                }, separators=(',', ':'))
+            elif api == 'tuya.test.gateway.gone':
+                # Test-only: the errorCode that historically had a special
+                # OPRT_COMMUNICATION_ERROR mapping; it must now be the same
+                # uniform business error as every other rejection.
+                response_json = json.dumps({
+                    "success": False,
+                    "t": int(time.time()),
+                    "errorCode": "GATEWAY_NOT_EXISTS",
+                    "errorMsg": "device removed from the cloud"
+                }, separators=(',', ':'))
             else:
                 response_json = json.dumps({
                     "success": False,

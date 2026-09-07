@@ -19,6 +19,12 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(AGENTIC_KIT_ENABLE_PROJECT_TESTS ${AGENTIC_KIT_BUILD_TESTS})
 set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
+# include(CTest) only calls enable_testing() while BUILD_TESTING is ON, and the cache
+# is forced OFF above — so re-configures would silently stop regenerating the ctest
+# list. Enable it explicitly for our own tests.
+if(AGENTIC_KIT_BUILD_TESTS)
+    enable_testing()
+endif()
 set(ENABLE_TESTING OFF CACHE BOOL "Disable mbedTLS tests" FORCE)
 set(ENABLE_PROGRAMS OFF CACHE BOOL "Disable mbedTLS programs" FORCE)
 set(ENABLE_TESTING OFF CACHE BOOL "Disable cJSON tests" FORCE)
@@ -80,25 +86,52 @@ add_library(core_http STATIC
     "${corehttp_source_dir}/source/dependency/3rdparty/llhttp/src/http.c"
     "${corehttp_source_dir}/source/dependency/3rdparty/llhttp/src/llhttp.c"
 )
-target_compile_definitions(core_http PUBLIC HTTP_DO_NOT_USE_CUSTOM_CONFIG)
-
+# No HTTP_DO_NOT_USE_CUSTOM_CONFIG: coreHTTP picks up common/core_http_config.h,
+# routing its Error/Warn into the log facade — the counterpart to coreMQTT above,
+# and the half that matters on the ATOP path the MQTT refusal docs send people to.
+#
+# `common` is PUBLIC here, unlike coreMQTT's PRIVATE: core_http_client.h itself
+# includes core_http_config_defaults.h (and through it core_http_config.h), so
+# every consumer of the header — http_client_interface.c — needs the path too.
 target_include_directories(core_http PUBLIC
     "${corehttp_source_dir}/source/include"
     "${corehttp_source_dir}/source/interface"
     "${corehttp_source_dir}/source/dependency/3rdparty/llhttp/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
 )
+
+# coreHTTP's objects now reference log_emit(); declare it rather than relying on
+# archive scan order. Same reasoning as core_mqtt.
+target_link_libraries(core_http PRIVATE agentic_kit_common)
 
 add_library(core_mqtt STATIC
     "${coremqtt_source_dir}/source/core_mqtt.c"
     "${coremqtt_source_dir}/source/core_mqtt_serializer.c"
     "${coremqtt_source_dir}/source/core_mqtt_state.c"
 )
-target_compile_definitions(core_mqtt PUBLIC MQTT_DO_NOT_USE_CUSTOM_CONFIG)
-
-target_include_directories(core_mqtt PUBLIC
-    "${coremqtt_source_dir}/source/include"
-    "${coremqtt_source_dir}/source/interface"
+# No MQTT_DO_NOT_USE_CUSTOM_CONFIG: coreMQTT picks up common/core_mqtt_config.h,
+# which routes its Error/Warn logs into the SDK log facade. Without it a refused
+# CONNECT reaches the caller as a bare MQTTServerRefused, with the broker's
+# actual reason discarded inside coreMQTT.
+#
+# `common` is PRIVATE: only coreMQTT's own three .c files include
+# core_mqtt_config_defaults.h (and through it core_mqtt_config.h) -- core_mqtt.h
+# does not, so consumers need nothing. PUBLIC would put this repo's `common/` on
+# every consumer's include path, where generic names like log.h and tls.h can
+# shadow an integrator's own headers.
+target_include_directories(core_mqtt
+    PUBLIC
+        "${coremqtt_source_dir}/source/include"
+        "${coremqtt_source_dir}/source/interface"
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/common"
 )
+
+# coreMQTT's objects now reference log_emit(). Declare it: without this the link
+# only succeeds because some other archive happens to be scanned first and drags
+# log.o in -- a target that links core_mqtt alone would fail. agentic_kit_common
+# is defined further down; CMake resolves target names regardless of order.
+target_link_libraries(core_mqtt PRIVATE agentic_kit_common)
 
 # -----------------------------------------------------------------------------
 # Common library (process-wide log facade, shared TLS transport, etc.)
@@ -160,12 +193,14 @@ set(IOT_CLIENT_SOURCES
     "${IOT_CLIENT_DIR}/src/atop_base.c"
     "${IOT_CLIENT_DIR}/src/cipher_wrapper.c"
     "${IOT_CLIENT_DIR}/src/http_client_interface.c"
+    "${IOT_CLIENT_DIR}/src/iot_atop.c"
     "${IOT_CLIENT_DIR}/src/iot_client.c"
     "${IOT_CLIENT_DIR}/src/iot_client_message.c"
     "${IOT_CLIENT_DIR}/src/iot_dns.c"
     "${IOT_CLIENT_DIR}/src/iot_dp.c"
     "${IOT_CLIENT_DIR}/src/iot_on_boarding.c"
     "${IOT_CLIENT_DIR}/src/iot_ota.c"
+    "${IOT_CLIENT_DIR}/src/iot_ota_verify.c"
     "${IOT_CLIENT_DIR}/src/iot_pal_defaults.c"
     "${IOT_CLIENT_DIR}/src/mqtt.c"
 )
@@ -286,11 +321,15 @@ if(AGENTIC_KIT_BUILD_TESTS AND AGENTIC_KIT_ENABLE_PROJECT_TESTS)
     agentic_kit_add_iot_test(iot_cipher_test "${IOT_CLIENT_TESTS_DIR}/cipher_test.c")
     agentic_kit_add_iot_test(iot_dns_test "${IOT_CLIENT_TESTS_DIR}/dns_test.c")
     agentic_kit_add_iot_test(iot_atop_test "${IOT_CLIENT_TESTS_DIR}/atop_test.c")
+    agentic_kit_add_iot_test(iot_atop_call_test "${IOT_CLIENT_TESTS_DIR}/iot_atop_call_test.c")
+    agentic_kit_add_iot_test(iot_session_token_test "${IOT_CLIENT_TESTS_DIR}/iot_session_token_test.c")
+    agentic_kit_add_iot_test(iot_reset_test "${IOT_CLIENT_TESTS_DIR}/iot_reset_test.c")
     agentic_kit_add_iot_test(iot_mqtt_test "${IOT_CLIENT_TESTS_DIR}/mqtt_test.c")
     agentic_kit_add_iot_test(iot_message_test "${IOT_CLIENT_TESTS_DIR}/iot_client_message_test.c")
     agentic_kit_add_iot_test(iot_on_boarding_test "${IOT_CLIENT_TESTS_DIR}/on_boarding_test.c")
     agentic_kit_add_iot_test(iot_dp_test "${IOT_CLIENT_TESTS_DIR}/iot_dp_test.c")
     agentic_kit_add_iot_test(iot_ota_test "${IOT_CLIENT_TESTS_DIR}/iot_ota_test.c")
+    agentic_kit_add_iot_test(iot_ota_verify_test "${IOT_CLIENT_TESTS_DIR}/iot_ota_verify_test.c")
 
     add_executable(tuya_ble_test
         "${TUYA_BLE_TESTS_DIR}/test_prov.c"

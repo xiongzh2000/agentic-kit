@@ -196,7 +196,6 @@ static int test_upgrade_get_with_upgrade(void)
         .devid   = TEST_DEVID,
         .key     = TEST_SEC_KEY,
         .channel = 0,
-        .sw_ver  = "1.0.0",
         .host    = MOCK_HOST,
         .port    = MOCK_PORT,
         .cacert  = g_cacert,
@@ -312,11 +311,10 @@ static int test_upgrade_status_update(void)
     const pal_t *pal = get_default_pal();
     iot_ota_status_t statuses[] = {
         OTA_STATUS_UPGRADING,
-        OTA_STATUS_UPGRAD_FINI,
-        OTA_STATUS_UPGRD_EXEC,
-        OTA_STATUS_UPGRD_ABORT,
+        OTA_STATUS_COMPLETE,
+        OTA_STATUS_ERROR,
     };
-    const char *names[] = { "UPGRADING", "FINISHED", "FAILED", "ABORTED" };
+    const char *names[] = { "UPGRADING", "COMPLETE", "ERROR" };
 
     for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); i++) {
         ota_status_update_request_t req = {

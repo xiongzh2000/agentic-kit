@@ -65,8 +65,8 @@ static void parse_activation_message(const pal_t *pal, const char *json_str, act
         const char *r = region->valuestring;
         if (strcmp(r, "AY") == 0) {
             message->region = AY;
-        } else if (strcmp(r, "US") == 0) {
-            message->region = US;
+        } else if (strcmp(r, "AZ") == 0) {
+            message->region = AZ;
         } else if (strcmp(r, "EU") == 0) {
             message->region = EU;
         } else if (strcmp(r, "IN") == 0) {
@@ -327,6 +327,11 @@ static int activate_device(const pal_t *pal, on_boarding_config_t *on_boarding, 
             case OPRT_COMMUNICATION_ERROR:
                 log_error("  - Communication error");
                 break;
+            case OPRT_ATOP_BUSINESS_ERROR:
+                /* e.g. an expired/used pairing token -- the cloud's errorCode
+                 * and errorMsg are logged by the envelope layer just above. */
+                log_error("  - Rejected by the cloud (see errorCode above)");
+                break;
             case OPRT_TLS_HANDSHAKE_FAILED:
                 log_error("  - TLS handshake failed");
                 break;
@@ -380,8 +385,8 @@ static int __token_to_region(const char *token, iot_region_t *region)
 
     if (strcmp(prefix, "AY") == 0) {
         *region = AY;
-    } else if (strcmp(prefix, "US") == 0) {
-        *region = US;
+    } else if (strcmp(prefix, "AZ") == 0) {
+        *region = AZ;
     } else if (strcmp(prefix, "UE") == 0) {
         *region = UEAZ;
     } else if (strcmp(prefix, "EU") == 0) {
@@ -501,26 +506,39 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
 
     // clientId: acon_{uuid}
     client_id = (char *)pal->malloc(6 + uuid_len);
-    if (!client_id) { ret = OPRT_MALLOC_FAILED; goto end; }
+    if (!client_id) {
+        log_error("Failed to allocate client_id buffer (%zu bytes)", 6 + uuid_len);
+        ret = OPRT_MALLOC_FAILED;
+        goto end;
+    }
     int sn = snprintf(client_id, 6 + uuid_len, "acon_%s", on_boarding->uuid);
     if (sn < 0 || (size_t)sn >= 6 + uuid_len) { ret = OPRT_COMMUNICATION_ERROR; goto end; }
 
     // username: acon_{uuid}|pv=2.3
     username = (char *)pal->malloc(14 + uuid_len);
-    if (!username) { ret = OPRT_MALLOC_FAILED; goto end; }
+    if (!username) {
+        log_error("Failed to allocate username buffer (%zu bytes)", 14 + uuid_len);
+        ret = OPRT_MALLOC_FAILED;
+        goto end;
+    }
     sn = snprintf(username, 14 + uuid_len, "acon_%s|pv=2.3", on_boarding->uuid);
     if (sn < 0 || (size_t)sn >= 14 + uuid_len) { ret = OPRT_COMMUNICATION_ERROR; goto end; }
 
     // password: first 16 chars of MD5(authkey)
     char password[17];
     if (iot_md5_password(on_boarding->authkey, password) != 0) {
+        log_error("Failed to compute MQTT auth password (MD5)");
         ret = OPRT_COMMUNICATION_ERROR;
         goto end;
     }
 
     // subscribe topic: d/ai/{uuid}
     subscribe_topic = (char *)pal->malloc(6 + uuid_len);
-    if (!subscribe_topic) { ret = OPRT_MALLOC_FAILED; goto end; }
+    if (!subscribe_topic) {
+        log_error("Failed to allocate subscribe_topic buffer (%zu bytes)", 6 + uuid_len);
+        ret = OPRT_MALLOC_FAILED;
+        goto end;
+    }
     sn = snprintf(subscribe_topic, 6 + uuid_len, "d/ai/%s", on_boarding->uuid);
     if (sn < 0 || (size_t)sn >= 6 + uuid_len) { ret = OPRT_COMMUNICATION_ERROR; goto end; }
 
@@ -529,7 +547,8 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
 
 
     // Query MQTT endpoint from IoT DNS service
-    const char *mqtt_dns_key = on_boarding->mqtt_disable_tls ? "mqttUrl" : "mqttsUrl";
+    const char *mqtt_dns_key = on_boarding->mqtt_disable_tls ? IOT_DNS_KEY_MQTT
+                                                            : IOT_DNS_KEY_MQTTS;
     iot_dns_config_item_t dns_keys[] = {
         { .key = mqtt_dns_key, .need_ca = !on_boarding->mqtt_disable_tls },
     };
@@ -569,6 +588,7 @@ int on_boarding_with_qrcode(const pal_t *pal, on_boarding_config_t *on_boarding,
     size_t broker_url_len = strlen(scheme) + 3 + strlen(mqtt_addr) + 1;
     broker_url = (char *)pal->malloc(broker_url_len);
     if (!broker_url) {
+        log_error("Failed to allocate broker URL buffer (%zu bytes)", broker_url_len);
         iot_dns_url_config_response_free(pal, &dns_resp);
         ret = OPRT_MALLOC_FAILED;
         goto end;

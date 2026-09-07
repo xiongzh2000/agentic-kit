@@ -92,6 +92,23 @@ iot_client_t *iot_client_init_on_boarding_with_token(
 跳过 MQTT 等待，直接使用已知 Token 发起激活请求。Region 由 Token 前两字符自动
 推导，无需手动指定。
 
+:::warning 必须连接 MQTT，App 才判定配网成功
+**App 只有在检测到设备连接上涂鸦云 MQTT 通道（设备上线）后，才会判定配网成功。**
+仅完成 Token 激活、拿到 `devid` 等凭据但不连接 MQTT，App 端会显示配网失败/超时。
+
+因此这一点现在由默认行为保证——自动连接是默认开启的，无需额外配置；只要不设 `.mqtt_disable_auto_connect`，设备就会在激活完成后自动连接 MQTT：
+
+```c
+iot_on_boarding_config_t cfg = {
+    // ...
+    // 不设 .mqtt_disable_auto_connect：默认即自动连接 MQTT，App 才能判定配网成功
+};
+```
+
+若选择保持 `false`，则必须在激活成功后立即手动调用
+`iot_client_connect()`。
+:::
+
 **`iot_on_boarding_config_t` 主要字段：**
 
 | 字段 | 说明 |
@@ -123,22 +140,22 @@ iot_client_t *iot_client_init_on_boarding_with_token(
 成功输出示例：
 
 ```
-=== pair example ===
+=== scan-by-device pair demo ===
 QR image     : res/qr.jpg
 UUID         : tuyaXXXXXXXXXXXX
 Product key  : p891xbkosae0dgda
 
-[pair] Image loaded: qr.jpg (400x400)
-[pair] QR payload: {"s":"MyWiFi","p":"password123","t":"AY..."}
-[pair] SSID    : MyWiFi
-[pair] Password: password123
-[pair] Token   : AY...
-[pair] Starting on-boarding with token...
-[pair] Activation successful!
-[pair] devid      : <device_id>
-[pair] secret_key : <secret_key>
-[pair] local_key  : <local_key>
-[pair] Session token acquired (len=1234)
+[scan_by_device] Image loaded: res/qr.jpg (400x400)
+[scan_by_device] QR payload: {"s":"MyWiFi","p":"password123","t":"AY..."}
+[scan_by_device] SSID    : MyWiFi
+[scan_by_device] Password: password123
+[scan_by_device] Token   : AY...
+[scan_by_device] Starting on-boarding with token...
+[scan_by_device] Activation successful!
+[scan_by_device] devid      : <device_id>
+[scan_by_device] secret_key : <secret_key>
+[scan_by_device] local_key  : <local_key>
+[scan_by_device] Session token acquired (len=1234)
 ```
 
 激活成功后，请将输出的 `devid`、`secret_key`、`local_key` 保存到设备持久化

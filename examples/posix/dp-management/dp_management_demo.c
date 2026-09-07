@@ -9,25 +9,26 @@
  *
  * Lifecycle shown here:
  *   1. Read the schema (schema.json) and DP state (dp_state.json) from separate files.
- *   2. iot_client_init() with mqtt_auto_connect=false -> DP registry built from schema.
+ *   2. iot_client_init() with mqtt_disable_auto_connect=true -> DP registry built from schema.
  *      Then validate the DP state against the schema and restore it only if it
  *      fully conforms (iot_dp_validate_json), discarding a stale/mismatched file.
- *   3. Fetch the MQTT CA via IoT DNS, then iot_client_message_connect().
+ *   3. Fetch the MQTT CA via IoT DNS, then iot_client_connect().
  *   4. iot_dp_report_all() right after connect (the cloud only learns state from
  *      reports; "report on connect" is mandatory app behaviour — see the ADR).
- *   5. Loop: pump downlinks (iot_client_message_process), and on a dropped link
+ *   5. Loop: pump downlinks (iot_client_process), and on a dropped link
  *      reconnect + re-report. Periodically simulate a local change (iot_dp_set +
  *      iot_dp_report_all_dirty) and poll for a schema upgrade.
  *   6. Persist on every change via the save callback; persist a newer schema via
  *      the schema-update callback. The SDK provides the mechanism; the app owns
  *      the storage.
- *   7. On Ctrl-C: dump the final state, disconnect, free, deinit.
+ *   7. On a cloud device-remove notice (reset_callback): wipe dp_state.json /
+ *      schema.json and exit with re-pair guidance.
+ *   8. On Ctrl-C: dump the final state, disconnect, free, deinit.
  */
 
 #include "dp_management_demo.h"
 
 #include "iot_client.h"
-#include "iot_client_message.h"   /* manual connect/disconnect/process (app-owned loop) */
 #include "iot_dp.h"
 
 #include <stdio.h>
@@ -70,6 +71,7 @@ static const char *DEFAULT_SCHEMA =
     "]";
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_reset = 0;
 
 static void on_signal(int sig)
 {
@@ -163,38 +165,50 @@ static void on_schema_update(const char *schema_id, const char *new_schema, void
     write_text_file(SCHEMA_PATH, new_schema);
 }
 
+/* Cloud device-remove notice (protocol 11). Fired on the MQTT process thread;
+ * must not block or call iot_client_deinit (use-after-free). Set a flag and
+ * let the main loop handle teardown. */
+static void on_reset(iot_reset_type_t type, void *user_data)
+{
+    (void)user_data;
+    printf("[%s] ** device removed from cloud (type=%s) **\n", TAG,
+           type == IOT_RESET_REMOTE_FACTORY ? "factory" : "unbind");
+    g_reset = 1;
+    g_running = 0;
+}
+
 /* ---- connection helpers -------------------------------------------------- */
 
 /* Resolve and attach the MQTT broker's CA (when using TLS and none was supplied),
  * so the demo connects against the real cloud without bundling a cert file.
- * Returns the allocated cert (assign to client->cacert; free at shutdown) or NULL. */
-static char *ensure_mqtt_ca(iot_client_t *client)
+ * The cert lives in a static buffer that outlives the client. */
+static void ensure_mqtt_ca(iot_client_t *client)
 {
+    static char mqtt_ca[4096];
+
     if (client->mqtt_disable_tls || client->cacert || client->mqtt_url[0] == '\0')
-        return NULL;
+        return;
 
     char scheme[8] = {0};
     char host[128] = {0};
     unsigned port = 0;
     if (sscanf(client->mqtt_url, "%7[^:]://%127[^:]:%u", scheme, host, &port) != 3) {
         fprintf(stderr, "[%s] cannot parse mqtt_url: %s\n", TAG, client->mqtt_url);
-        return NULL;
+        return;
     }
 
-    char *ca = NULL;
-    if (iot_get_ca_certificate(client, host, (uint16_t)port, &ca) != OPRT_OK || !ca) {
+    if (iot_get_ca_certificate(client, host, (uint16_t)port, mqtt_ca, sizeof(mqtt_ca)) != OPRT_OK) {
         fprintf(stderr, "[%s] failed to fetch MQTT CA for %s:%u\n", TAG, host, port);
-        return NULL;
+        return;
     }
-    client->cacert = ca;   /* must outlive the client */
-    return ca;
+    client->cacert = mqtt_ca;
 }
 
 /* Connect and immediately re-publish full state — the cloud only learns DP state
  * from device-initiated reports, so this runs after every (re)connect. */
 static int connect_and_report(iot_client_t *client)
 {
-    int ret = iot_client_message_connect(client);
+    int ret = iot_client_connect(client);
     if (ret != OPRT_OK) {
         fprintf(stderr, "[%s] MQTT connect failed: %d\n", TAG, ret);
         return ret;
@@ -294,10 +308,11 @@ int demo_dp_management_run(const char *devid,
         .region           = AY,      /* match your device's region/env */
         .env              = PROD,
         .mqtt_disable_tls = false,   /* mqtts */
-        .mqtt_auto_connect = false,  /* we own the connect/reconnect loop */
+        .mqtt_disable_auto_connect = true,  /* we own the connect/reconnect loop */
         .schema           = saved_schema ? saved_schema : DEFAULT_SCHEMA,
         .schema_id        = schema_id,
         .dp_state         = NULL,    /* don't auto-restore — we validate first (step 2b) */
+        .reset_callback   = on_reset,
     };
     strncpy(cfg.devid,      devid,      sizeof(cfg.devid) - 1);
     strncpy(cfg.secret_key, secret_key, sizeof(cfg.secret_key) - 1);
@@ -334,9 +349,8 @@ int demo_dp_management_run(const char *devid,
     iot_dp_set_schema_update_callback(client, on_schema_update, NULL);
 
     /* 4. CA + connect + report-on-connect. */
-    char *mqtt_ca = ensure_mqtt_ca(client);
+    ensure_mqtt_ca(client);
     if (connect_and_report(client) != OPRT_OK) {
-        if (mqtt_ca) client->pal->free(mqtt_ca);
         iot_client_deinit(client);
         return -1;
     }
@@ -348,11 +362,11 @@ int demo_dp_management_run(const char *devid,
     time_t last_schema = time(NULL);   /* don't poll schema immediately */
     while (g_running) {
         /* Pump the receive path; downlinks dispatch into on_dp_downlink. */
-        int rc = iot_client_message_process(client, 200);
+        int rc = iot_client_process(client, 200);
         if (rc != OPRT_OK) {
             /* No auto-reconnect in the SDK: the app reconnects, then re-reports. */
             fprintf(stderr, "[%s] link error %d; reconnecting...\n", TAG, rc);
-            iot_client_message_disconnect(client);
+            iot_client_disconnect(client);
             if (connect_and_report(client) != OPRT_OK) {
                 sleep(2);
                 continue;
@@ -376,7 +390,22 @@ int demo_dp_management_run(const char *devid,
         }
     }
 
-    /* 6. Pull the final state on demand (alternative to the save callback). */
+    /* 6. If the device was removed from the cloud, wipe all persisted state
+     *    so the next boot re-enters pairing. The credentials (devid/secret_key/
+     *    local_key) were passed on the command line — the app must also erase
+     *    wherever it stored them (not shown here). To re-pair, run the
+     *    scan-by-app demo under examples/posix/pair/scan-by-app/. */
+    if (g_reset) {
+        printf("[%s] wiping persisted state (device removed)\n", TAG);
+        remove(DP_STATE_PATH);
+        remove(SCHEMA_PATH);
+        iot_client_disconnect(client);
+        iot_client_deinit(client);
+        printf("[%s] device reset complete — re-run pairing to activate\n", TAG);
+        return 0;
+    }
+
+    /* 7. Pull the final state on demand (alternative to the save callback). */
     printf("\n[%s] shutting down\n", TAG);
     char *final_state = NULL;
     if (iot_dp_dump_json(client, &final_state) == OPRT_OK && final_state) {
@@ -385,9 +414,8 @@ int demo_dp_management_run(const char *devid,
         client->pal->free(final_state);
     }
 
-    /* 7. Tear down. */
-    iot_client_message_disconnect(client);
-    if (mqtt_ca) client->pal->free(mqtt_ca);
+    /* 8. Tear down. */
+    iot_client_disconnect(client);
     iot_client_deinit(client);
     return 0;
 }

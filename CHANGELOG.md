@@ -7,153 +7,212 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **IoT Client — OTA firmware upgrade support** (`modules/iot-client/include/iot_ota.h`).
-  High-level OTA API for version reporting, upgrade checks, and upgrade-status
-  reporting, backed by three new ATOP service calls: `tuya.device.upgrade.get`
-  (v4.4), `tuya.device.versions.update` (v4.1), and
-  `tuya.device.upgrade.status.update` (v4.1).
-  - `iot_ota_report_version` — reports the device's current firmware version
-    (also auto-called during `iot_client_init`, so the cloud can evaluate
-    upgrades).
-  - `iot_ota_check_upgrade` — queries the cloud for a pending upgrade and
-    returns version, download URL (`cdnUrl` preferred, `httpsUrl` fallback),
-    file size, and MD5/HMAC hashes.
-  - `iot_ota_report_status` — drives the upgrade lifecycle
-    (UPGRADING → FINI / EXEC / ABORT).
-  - The SDK handles **only the cloud protocol**; the application owns download
-    and flash (e.g. ESP-IDF `esp_ota_*` or a vendor bootloader API).
-  - `atop_base` gains an AES-128-ECB fallback decrypt path for older (`et=1`)
-    cloud responses.
-  - Unit tests with mocked ATOP endpoints (`iot_ota_test`), a POSIX `ota-demo`,
-    and an ESP-IDF `ota-demo` with a two-partition OTA table.
-
 ### Changed
 
-- **common / TLS — ESP-IDF cert-bundle decoupled via callback.**
-  Replaced `#ifdef CONFIG_IDF_TARGET` / `use_cert_bundle` in `common/tls.c` with a
-  platform-supplied callback `tls_cert_bundle_attach_fn` (field `cert_bundle_attach`
-  on `tls_config_t` / `tai_config_t`). When set, the TLS layer sets `VERIFY_REQUIRED`
-  and invokes it during setup; when NULL, it falls through to the `verify`/`cacert`
-  path. The core library no longer includes `esp_crt_bundle.h` or has any ESP-IDF
-  conditional compilation; the ESP-IDF example passes `esp_crt_bundle_attach` through
-  `tai_config_t.cert_bundle_attach`.
-
-- **RTC TCP Client (`tuya_ai`) — receive callbacks are now struct-based (ABI break).**
-  `on_audio` / `on_text` / `on_event` / `on_disconnect` each take a single const message
-  pointer (`tai_audio_msg_t` / `tai_text_msg_t` / `tai_event_msg_t` / `tai_disconnect_msg_t`)
-  instead of positional parameters. The structs surface previously-dropped metadata —
-  `stream_flag`, `data_id`, `event_id`, `codec`, `seq`, `timestamp_ms` — and `on_disconnect`
-  now distinguishes its source via `reason` (SESSION_CLOSE / CONNECTION_CLOSE / TRANSPORT /
-  PROTOCOL) plus `detail`. Inner pointers are valid only for the callback's duration (copy to
-  retain). Adds `tai_config_t.connect_timeout_ms` (reserved for confirmed connect). All
-  consumers (examples + integration tests) updated. First phase of the `tuya_ai` protocol-layer
-  redesign; fail-fast recovery and streaming send follow.
-
-- **RTC TCP Client (`tuya_ai`) — downstream audio-params re-read per stream.** Audio parameters
-  (`codec` / `sample_rate` / `frame_size`) are now re-parsed on each stream START / ONE_SHOT, so a
-  second downstream audio stream no longer inherits the previous stream's `frame_size` or codec.
-  (Fragmented Audio/Text is reassembled whole before the dispatcher splits it into CBR Opus frames,
-  as before.)
-
-- **RTC TCP Client (`tuya_ai`) — scatter-gather streaming send (~107 KB less RAM).**
-  EVERY packet — media (audio chunks, images, large text, MCP JSON) and control — now streams
-  through one scatter-gather sender instead of being assembled into a large contiguous frame
-  buffer. For media only a small application header is built (≤256 B) and the payload is signed +
-  written zero-copy from the caller's buffer; for control the whole packet (assembled in
-  `tx_ctrl_buf`, whose attribute block can carry the session/event JSON — escaped JSON must fit
-  `TAI_TX_CTRL_BUF_SIZE`, default 1 KB) is itself the zero-copy payload. The two 64 KB static TX
-  buffers (`tx_app_buf` + `tx_frame_buf`) and the contiguous control frame buffer
-  (`tx_ctrl_frame_buf`) are all gone — the context's send-side buffers drop from ~128 KB to
-  ~1.3 KB — and the
-  per-chunk payload `malloc` + triple copy become one small header copy plus a zero-copy payload
-  write. The frame HMAC was generalised to sign a logical segment list (`tai_frame_hmac_sg`),
-  byte-for-byte identical to the old contiguous signature (golden-matrix tested), so the wire
-  format and the receiver are unchanged. ClientHello (sent unsigned, one-shot) is framed inline on
-  the stack. Trade-offs (§6.6): each frame is 2–3 TLS records instead of one, and a send failure
-  mid-frame desyncs the wire stream — it returns `TAI_ERR_NET` (a synchronous error the caller
-  acts on: an app sender disconnects + reconnects; the worker's own periodic Ping turns a failed
-  send into a TRANSPORT disconnect). Third phase of the `tuya_ai` redesign.
-
-- **RTC TCP Client (`tuya_ai`) — smaller receive buffers via a smaller max fragment.**
-  `TAI_MAX_FRAGMENT_PAYLOAD` is now 4 KB (was 32 KB) and is advertised to the server in ClientHello
-  as `TAI_ATTR_MAX_FRAGMENT_LEN`. The RX sliding-window buffer is now *derived* —
-  `TAI_RX_BUF_SIZE = TAI_MAX_FRAGMENT_PAYLOAD + 37` (exactly one max wire frame) — instead of a
-  fixed 64 KB, and the fragment-reassembly buffer drops from 128 KB to 32 KB (the largest inbound
-  packet the device accepts; a larger one is fail-fast `TAI_PROTO_ERR_FRAG`). Net: the context
-  shrinks to ~37 KB (from ~320 KB at the start of the redesign). Caveat: `rx_buf` has zero
-  headroom, so it relies on the server honouring the advertised `MAX_FRAGMENT_LEN`; an oversized
-  inbound frame is now detected and fail-fast (`TAI_PROTO_ERR_OVERSIZED`) rather than stalling the
-  receive loop until the liveness timeout. Tune `TAI_MAX_FRAGMENT_PAYLOAD` / `TAI_FRAG_BUF_SIZE`
-  up for larger fragments / packets.
+- rtc-client — upgrade libstm(#33).
+- rtc-client — frames under `TAI_FRAME_COALESCE_LIMIT` (default 512 B) now coalesce into a
+  single transport write: Ping, control packets and small audio chunks drop from 2–3 TLS
+  records to 1(#32).
 
 ### Fixed
 
-- **RTC TCP Client (`tuya_ai`) — code-review pass (concurrency, forward-compat, fail-fast).**
-  - `tai_disconnect` now holds the send lock across the transport close (not just the
-    SessionClose), so a concurrent sender on another thread can no longer use a TLS context this
-    is freeing (use-after-free); the close nulls the handle under the lock, so a racing send fails
-    cleanly.
-  - **Unknown downstream Packet/Event types are now tolerated** (logged + skipped) instead of
-    tearing the Connection down, so a server adding a forward-compatible new type does not knock
-    existing clients into a reconnect storm. Malformed (decode-failure) packets are still fail-fast.
-  - An oversized inbound frame (declared size > `rx_buf`) is now fail-fast
-    (`TAI_PROTO_ERR_OVERSIZED`) instead of stalling until the liveness timeout.
-  - `on_disconnect` is single-point for TERMINAL disconnects: a transport/protocol/connection-close
-    cause fires it at most once per Connection. A non-terminal server SessionClose
-    (`connection_alive=1`, the link may persist for a new session) is a distinct event — it does not
-    latch the guard and does not suppress a later real transport death, so an app that keeps the link
-    after a SessionClose is still told when the connection actually dies.
-  - `on_disconnect` is no longer fired on the connecting thread: a server SessionClose received
-    during `tai_connect`'s synchronous SessionNew-ack wait (before the worker exists) is surfaced via
-    `tai_connect`'s return value instead of an out-of-band callback, honoring the "callbacks run on
-    the worker thread" contract.
-  - The unsigned ClientHello is now framed into a buffer sized to `TAI_TX_CTRL_BUF_SIZE` (was a fixed
-    256 B), so a long `client_id`/`device_id` connects instead of failing `tai_connect` with a
-    confusing buffer error; the only limit is the same control buffer the build step already enforces.
-  - An app-thread send failure that fails *after* committing bytes (mid-fragment of a multi-fragment
-    packet) no longer rolls back the sequence number — the seq is reclaimed only when nothing of the
-    packet reached the wire, keeping the `TAI_ERR_NET`-means-committed contract intact.
-  - Random hex IDs (`gen_id`) now fail the build cleanly if the RNG errors at runtime, instead of
-    hex-encoding an uninitialized stack buffer into a wire id.
-- **iot-client / common — TLS consolidation follow-ups.**
-  - `mqtt` / `http` transport recv now surface a graceful peer TLS close (`tls_read` returns 0 on
-    `close_notify`) as a communication error instead of an idle "no data" poll, so a server-initiated
-    close is detected immediately rather than at the keepalive timeout.
-  - The shared process-wide RNG (`rng_bytes`) is now serialized by a pal mutex, removing a data
-    race on the single CTR-DRBG between subsystems on different threads (the consolidation collapsed
-    three per-subsystem DRBGs into one). The mutex is created in `rng_init(const pal_t *)` and locked
-    per call via `rng_bytes(const pal_t *, ...)` — both now take the pal, so the locking stays within
-    the SDK's platform abstraction instead of calling an OS threading API from `common/`. Knock-on
-    signature changes (each now carries the pal so it can reach the DRBG lock): `tai_random_bytes`,
-    `pv23_encrypt` / `pv23_decrypt` gain a leading `const pal_t *` (encrypt locks the DRBG for its
-    internally-generated IV — kept inside for GCM nonce misuse-resistance; decrypt takes it for
-    symmetry and ignores it), and the TLS `f_rng` callback carries the pal via mbedTLS's `p_rng`.
-  - `iot_init` now fails if RNG seeding fails (previously the error was swallowed and resurfaced
-    later as opaque TLS/nonce errors).
-- **PAL (FreeRTOS) — allocator mismatch.** The worker-thread struct allocated with `pal_malloc`
-  (SPIRAM-capable on ESP-IDF) is now freed with `pal_free`, not `vPortFree`, so it is released back
-  to the heap it came from.
-- **RTC TCP Client (`tuya_ai`) — connect / disconnect robustness.**
-  - `tai_connect` now completes on the server's `AuthenticateResponse` (packet type 3, carrying
-    `connection-status-code` — 200 = OK), not only on a `SessionNew` ack. The production server
-    confirms the handshake this way and immediately starts the session; the client previously fell
-    through to the unknown-packet path and timed out (`SessionNew ack timeout` → `tai_connect`
-    failed). The `SessionNew`-ack path is kept for compatibility.
-  - `tai_disconnect` now returns promptly on an idle link. The receive worker's idle blocking read
-    is capped (`TAI_WORKER_POLL_CAP_MS`) so it observes `running = 0` quickly, instead of waiting
-    out the remainder of a full ping interval (up to ~60 s) before the join could return.
-- **common / TLS — handshake bound & hardening follow-ups.**
-  - The shared TLS handshake is now bounded by a deadline (`tls_config_t.handshake_timeout_ms`;
-    rtc-tcp-client passes `connect_timeout_ms`, others use a default). A peer that completes the TCP
-    connect but stalls the TLS handshake can no longer hang the caller indefinitely, and a socket
-    error reported by `tcp_poll` during the handshake fails fast instead of spinning to the deadline.
-  - Restored human-readable X.509 verification diagnostics (`mbedtls_x509_crt_verify_info`) that the
-    per-module TLS logged before consolidation — a cert failure now reports the reason (CN mismatch /
-    expired / untrusted chain) instead of only a hex flag.
-  - `rng_bytes()` and `pv23_encrypt()` reject a NULL `pal` up front instead of dereferencing it, and
-    the CA-PEM temp buffer in `tls_connect` drops a redundant `memset` / `strlen`.
+- iot-client — US-East (`UEAZ`) fell back to an ATOP host that does not resolve(#31).
+  `IOT_UEAZ_HOST` is now `a1-ueaz.tuyaus.com`.
+
+## [0.4.0] - 2026-08-27
+
+### Added
+
+- iot-client — device-initiated reset (`iot_client_reset`), for a device that
+  unbinds itself instead of waiting to be removed from the app(#27).
+  - `OPRT_OK` destroys the client; any other code leaves it usable so the call
+    can be retried.
+  - `iot_reset_scope_t` chooses how much the cloud clears(#28):
+    `IOT_RESET_UNBIND_ONLY` drops the binding and keeps the device's cloud-side
+    data, `IOT_RESET_FACTORY` also discards that data and **cannot be undone**.
+  - The optional `error_code` out-param carries the cloud's rejection reason —
+    needed to tell a terminal `GATEWAY_NOT_EXISTS` (wipe credentials, re-pair)
+    from a retryable `REMOTE_API_RUN_UNKNOW_FAILED`.
+  - It does not erase persisted credentials/DP state/schema; that stays the
+    app's job. Shown in `pair/api-activate --release`.
+- iot-client — `iot_client_get_session_token_ex()` reports *why* the cloud
+  refused an agent token(#29). The refusals need opposite handling — a terminal
+  `GATEWAY_NOT_EXISTS` (device removed; re-pair) versus retryable ones — and the
+  plain function cannot tell them apart.
+- iot-client — `iot_client_connect()` / `iot_client_disconnect()` are public(#26).
+  A reconnect loop previously had to reach into `src/iot_client_message.h`,
+  which is not installed.
+- iot-client — generic ATOP call (`iot_atop_call`), for cloud interfaces the SDK
+  does not wrap by name(#19).
+  - New public header `iot_atop.h`: pass an `api` name, its `version` and a JSON
+    body; get the envelope's `result` back as a JSON string plus the cloud's
+    `errorCode` / `errorMsg`. Activated devices only.
+  - `docs-site/docs/guides/atop-generic-call.md` lists the named wrappers and
+    when to promote an interface to one.
+- iot-client — cloud device-remove (protocol 11) callback(#18).
+  - New `iot_reset_callback_t` / `iot_reset_type_t`; registering it makes the
+    SDK consume protocol-11 notices instead of passing them to
+    `message_callback`.
+- iot-client — OTA firmware digest verification (`iot_ota_verify_*`)(#17).
+  - Streaming verifier (`init` / `update` / `finish` / `abort`) so a download can
+    be checked without buffering the image.
+- common — coreMQTT and coreHTTP Error/Warn logs are routed into the SDK log
+  facade (`common/core_{mqtt,http}_config.h`)(#24, #25).
+  - A refused CONNECT now names the reason (`Connection refused: bad user name
+    or password.`) instead of a bare `MQTT_Connect failed: 6`, and an oversized
+    ATOP response says `insufficient space: responseBufferLen=...`.
+  - `mqtt.c`'s own log lines print the symbolic `MQTTStatus_t` name alongside the
+    number. `docs-site/docs/reference/iot-client.md` gains status and CONNACK
+    tables for reading older logs.
+  - Do not set `MQTT_DO_NOT_USE_CUSTOM_CONFIG` / `HTTP_DO_NOT_USE_CUSTOM_CONFIG`
+    again — in either build path — or the reasons go silent.
+- iot-client — APP-confirmed OTA notice (protocol 15) callback(#21).
+  - New `iot_ota_confirm_callback_t` on both config structs: the cloud pushes it
+    once the user confirms the upgrade in the app, with the firmware channel.
+    Registering it makes the SDK consume protocol-15 notices.
+- Examples — device-unbind demo (`unbind_demo`)(#18).
+- Examples — agent trigger demo (`tai_agent_trigger_demo`)(#22).
+- Examples — music play demo (`tai_music_play_demo`)(#12).
+- rtc-tcp-client — send an image and streamed audio as ONE multimodal event
+  (`tai_send_image_audio_start()` / `_chunk()` / `_end()`)(#20).
+- rtc-tcp-client — per-connection custom parameters on `EventStart` via
+  `tai_config_t.event_custom_param_json`(#20).
+- rtc-tcp-client — `tai_set_event_params()` changes event parameters per turn,
+  for devices that alternate between turn kinds(#20).
+
+### Changed
+
+- **BREAKING** iot-client — MQTT auto-connect is on by default;
+  `mqtt_auto_connect` becomes `mqtt_disable_auto_connect` on both config
+  structs(#26).
+  - Migration: `.mqtt_auto_connect = false` → `.mqtt_disable_auto_connect = true`;
+    `.mqtt_auto_connect = true` can be deleted. The rename means old code fails
+    to compile rather than silently changing behaviour.
+  - A failed auto-connect still returns `NULL` from `iot_client_init()`. Devices
+    that may boot without a network, or that use ATOP over HTTP with no broker,
+    must now opt out and drive the link themselves.
+- **BREAKING** iot-client — `iot_get_qrcode_info` and `iot_get_ca_certificate`
+  write into caller-provided buffers; `iot_qrcode_response_t` is removed(#10).
+- **BREAKING** Examples — every POSIX example binary is named after its source
+  file. The rtc-client (prebuilt UDP lib) demos gain a `udp_` prefix:
+  `chat_demo` / `edu_camera_demo` become `udp_chat_demo` / `udp_edu_camera_demo`.
+- Docs — the cloud-VAD turn boundary is `TAI_EVT_CHAT_BREAK`, not
+  `TAI_EVT_SERVER_VAD`.
+  - The cloud no longer sends `TAI_EVT_SERVER_VAD` (type 5) in cloud-VAD mode; it
+    ends a user turn with an inbound `TAI_EVT_CHAT_BREAK` (type 4). The constant
+    is kept for protocol compatibility but marked legacy.
+- Observability — diagnostic logging on previously-silent error paths (core
+  modules + PAL)(#11). PAL logs `errno` on socket failures; `tls_read`/`tls_write`
+  log the raw mbedTLS cause instead of collapsing to `TLS_ERR_NET`.
+- Examples — the rtc-tcp-client POSIX demos share their parsing helpers
+  (`demo_json.h`, `demo_text.h`)(#14).
+
+### Fixed
+
+- iot-client — a cloud-rejected ATOP call reported success(#19). A `success: false`
+  envelope logged `errorCode` / `errorMsg`, dropped them and returned `OPRT_OK`;
+  it now returns `OPRT_ATOP_BUSINESS_ERROR` uniformly, with both strings on the
+  response. Callers needing per-code policy branch on `error_code`.
+- iot-client — a peer that closed a non-TLS MQTT connection went unnoticed until
+  the 60 s keepalive expired(#26): `transport_recv()` passed a 0 (EOF per `pal.h`)
+  straight to coreMQTT, which reads it as "no data yet".
+- iot-client — tearing down an already-dead link no longer pushes a DISCONNECT
+  into a socket that cannot carry it(#26). Only `MQTTRecvFailed` / `MQTTSendFailed` /
+  `MQTTKeepAliveTimeout` count as dead; a completed exchange clears the flag.
+- iot-client — `iot_client_deinit()` wipes the client before freeing it(#27). `devid`,
+  `secret_key` and `local_key` are plaintext in `iot_client_t`, and an embedded
+  allocator hands the block to whatever mallocs next.
+- iot-client — US-East (`UEAZ`) and West-Europe (`WEAZ`) never resolved an MQTT
+  broker(#15). `iot_region_to_string()` sent the enum name where the service
+  expects the two-letter activation-token prefix.
+- iot-client — an ATOP response larger than the buffer reported a generic
+  communication error(#23). `REQUEST_HEADER_BUFFER_SIZE` and
+  `RESPONSE_BUFFER_SIZE` are now `#ifndef`-guarded so an application can size
+  them with `-D`, and `HTTPInsufficientMemory` logs what was needed versus what
+  the buffer holds. A product whose schema came back at contentLength 6558
+  against the 4096 default looked like a network fault.
+- iot-client — SG region no longer falls back to the China ATOP host(#9).
+- iot-client — US region renamed to `AZ`(#7). The DNS region string and token
+  prefix for US West (Oregon) is `AZ`, not `US`.
+- common/tls — a TLS 1.3 `NewSessionTicket` tore the session down(#20).
+  `MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET` is a non-fatal "read again"
+  signal that `tls_read()` treated as an error.
+- Examples — `unbind-demo --reset` no longer requires a working MQTT connection(#27).
+  Reset travels over ATOP HTTPS, and gating it on CONNECT disabled the flag in
+  the one case it exists for: a device the cloud has already unbound.
+- Examples — `audio_chat_demo` could not parse its session token on hosts where
+  `/opt/homebrew/include` holds mbedtls 4.x headers: that directory lands first
+  on this one target's include path (via `find_path(opus)`), shadowing the
+  vendored 3.6.6 headers.
+- Examples — `audio_chat_demo` sends its one-shot file audio under the device-VAD
+  attributes it actually implements (`asr.enableVad`).
+- Examples — the tool-less rtc-tcp-client demos answer MCP requests correctly:
+  each reply now echoes the request id instead of a hardcoded `"id":1`(#14).
+- Examples — text streams that cannot be reassembled are reported, not dropped
+  silently(#14).
+- Examples — NLG prose is unescaped before printing(#14).
+- Examples — a value too long for a display-only field truncates instead of
+  being emptied(#14).
+- Examples — out-of-bounds read on received text: `tai_text_msg_t.text` is a
+  borrowed, non-NUL-terminated slice(#14).
+- Examples — stack overflow from over-long `argv` credentials(#14).
+
+## [0.3.0] - 2026-07-13
+
+### Added
+
+- IoT Client — OTA firmware upgrade support(#3).
+  - `iot_ota_report_version` — reports the device's current firmware version
+    (auto-called during `iot_client_init` from `iot_client_config_t.sw_ver`, so
+    the cloud can evaluate upgrades against the running version).
+  - `iot_ota_check_upgrade` — queries the cloud for a pending upgrade and
+    returns version, download URL (`cdnUrl` preferred, `httpsUrl` fallback),
+    file size, and MD5/HMAC hashes. Takes no `sw_ver` argument — the cloud
+    compares against the version already reported at init.
+  - `iot_ota_report_status` — drives the upgrade lifecycle
+    (UPGRADING → FINI / EXEC / ABORT).
+- RTC TCP Client (`tuya_ai`) — received images delivered via `on_image` callback(#6).
+  - New `tai_image_msg_t` + `on_image` callback (message-struct API); format/width/height parsed from image-params on START/ONE_SHOT.
+  - `TAI_PKT_IMAGE` now handled in `tai_proto_dispatch` (was dropped as unknown) — strips the 8-byte media header and emits each chunk for the caller to reassemble START..END / ONE_SHOT.
+
+### Changed
+
+- PAL / common — TCP connect timeout(#1).
+  - `tcp_connect` takes a `timeout_ms`, bounded by `select()` (0 = single non-blocking attempt).
+  - Threaded through all call sites (ai-tcp, HTTP, MQTT's new `MQTT_CONNECT_TIMEOUT_MS`).
+  - `tls_config_t`'s two timeouts collapse into `connect_timeout_ms` — one deadline for TCP connect + TLS handshake (removes `handshake_timeout_ms`).
+- common / TLS — ESP-IDF cert-bundle decoupled via callback(#2).
+- iot-client / common — memory-management pass(#4).
+  - `iot_client_t` inlines `https_url`/`mqtt_url` as `char[64]` and the DP context as inline storage (were `strdup` / lazy `malloc`), `_Static_assert`-guarded.
+  - Per-op allocations removed: stacked atop sign buffer + MQTT subscribe/publish topics; HTTP request-header and response share one allocation; DP report/state returns the cJSON string directly; `tai_pkt_log` formats into a stack buffer.
+  - mbedTLS global config (allocator, record sizes) left to the integrator — removed the SDK-side `MBEDTLS_USER_CONFIG_FILE` wiring, ownership documented in `common/tls.h`.
+- RTC TCP Client (`tuya_ai`) — protocol-layer redesign.
+  - Receive callbacks are now struct-based (ABI break).
+  - Downstream audio-params re-read per stream.
+  - Scatter-gather streaming send.
+  - Smaller receive buffers via a smaller max fragment.
+
+### Fixed
+
+- RTC TCP Client (`tuya_ai`) — protocol-layer redesign.
+  - `tai_disconnect` holds the send lock across the transport close (fixes a use-after-free).
+  - Unknown downstream Packet/Event types are tolerated (logged + skipped); malformed packets stay fail-fast.
+  - Oversized inbound frame is fail-fast (`TAI_PROTO_ERR_OVERSIZED`) instead of stalling to the liveness timeout.
+  - `on_disconnect` fires at most once per Connection, for terminal disconnects only.
+  - `on_disconnect` is no longer fired on the connecting thread.
+  - Unsigned ClientHello framed into a `TAI_TX_CTRL_BUF_SIZE` buffer (was a fixed 256 B).
+  - A send failure after committing bytes no longer rolls back the sequence number.
+  - `gen_id` fails cleanly when the RNG errors, instead of emitting an uninitialized id.
+  - Graceful peer TLS close (`close_notify`) surfaced as a comms error, detected immediately.
+  - Shared process-wide RNG (`rng_bytes`) serialized by a pal mutex (fixes a CTR-DRBG data race).
+  - `iot_init` now fails if RNG seeding fails.
+  - `tai_connect` completes on the server's `AuthenticateResponse` (type 3), not only a `SessionNew` ack.
+  - `tai_disconnect` returns promptly on an idle link (worker poll capped by `TAI_WORKER_POLL_CAP_MS`).
+- PAL (FreeRTOS) — allocator mismatch: the worker-thread struct is freed with `pal_free`, not `vPortFree`.
+- atop — `atop_activate_request` stack-allocates its response like the other ATOP calls, fixing an OOM leak of the POST-body buffer on the response-malloc-failure path.
+- common / TLS — hardening follow-ups.
+  - Restored human-readable X.509 verification diagnostics (`mbedtls_x509_crt_verify_info`).
+  - `rng_bytes()` / `pv23_encrypt()` reject a NULL `pal`; redundant `memset`/`strlen` dropped in `tls_connect`.
 
 ## [0.2.0] - 2026-06-12
 
@@ -180,4 +239,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP `mcp_example` example** demonstrating MCP tool integration with the agentic-kit
   framework.
 
+[0.3.0]: https://github.com/tuya/agentic-kit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tuya/agentic-kit/compare/v0.1.0...v0.2.0

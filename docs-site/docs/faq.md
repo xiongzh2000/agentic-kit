@@ -41,7 +41,7 @@ RTC Client（`stm_open_*`）以预编译静态库形式提供，当前支持：
 
 ## 设备端是否需要 VAD？
 
-**不是必须的。** 云端提供 Server VAD 能力（`TAI_EVT_SERVER_VAD`），设备端持续发送音频即可，云端检测到用户停止说话后会通知设备。
+**不是必须的。** 云端提供 Server VAD 能力，设备端持续发送音频即可，云端检测到用户停止说话后会通知设备——当前云端以 `TAI_EVT_CHAT_BREAK` 作为回合结束信号（`TAI_EVT_SERVER_VAD` 已不再下发，常量仅为协议兼容保留）。注意：云端 VAD 模式下收到回合结束信号后**不要**调用 `tai_send_audio_end()`，整个会话保持上行音频流打开。
 
 **但推荐以下场景使用设备端 VAD：**
 
@@ -89,9 +89,8 @@ UDP实现版本有非常好的弱网性能支持, 即使在网络条件很差的
 - 重新调用 `iot_client_get_session_token()` 获取新 token，然后创建新 session
 
 **RTC TCP Client：**
-- 使用长连接 + Ping/Pong 保活，不依赖 session_token
+- 连接建立时需要 `agent_token`（通过 `iot_client_get_session_token()` 获取），但建立后使用长连接 + Ping/Pong 保活，无需定期刷新 token
 - 如果连接断开（`on_disconnect` 回调），由持有 `tai_ctx_t` 的线程重新调用 `tai_connect()` 即可
-- 连接刷新由协议内部自动处理（`CONNECTION_REFRESH_REQ/RESP`）
 
 :::caution 不要在回调里重连
 所有回调都运行在后台工作线程上。**绝对不要**在回调（包括 `on_disconnect`）内部调用 `tai_connect()` / `tai_disconnect()` / `tai_ctx_deinit()`——这些函数会 join 工作线程，导致自死锁（self-deadlock）。

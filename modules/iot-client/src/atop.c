@@ -221,7 +221,7 @@ int atop_activate_request(const pal_t *pal, const activite_request_t *request, a
                                         .path = "/d.json",
                                         .timestamp = timestamp,
                                         .api = "thing.device.opensdk.active",
-                                        .version = "1.0",
+                                        .version = "2.0",
                                         .data = (void *)buffer,
                                         .datalen = offset,
                                         .user_data = request->user_data,
@@ -543,6 +543,14 @@ int atop_ai_token_get(const pal_t *pal, const ai_token_request_t *request, ai_to
     pal->free(post_data);
 
     if (rt != OPRT_OK) {
+        /* Carry the cloud's verdict out. Without this the caller sees only
+         * OPRT_ATOP_BUSINESS_ERROR, and "device removed from the cloud",
+         * "privacy agreement unsigned" and "no agent configured" become the
+         * same number — they need opposite handling. */
+        snprintf(response->rejection.code, sizeof(response->rejection.code), "%s",
+                 atop_response.error_code);
+        snprintf(response->rejection.msg, sizeof(response->rejection.msg), "%s",
+                 atop_response.error_msg);
         log_error("http post err, rt:%d", rt);
         atop_base_response_free(pal,&atop_response);
         return rt;
@@ -567,6 +575,7 @@ int atop_ai_token_get(const pal_t *pal, const ai_token_request_t *request, ai_to
     atop_base_response_free(pal, &atop_response);
 
     if (response->token == NULL) {
+        log_error("Failed to allocate token");
         return OPRT_MALLOC_FAILED;
     }
 
@@ -743,17 +752,16 @@ int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota
 
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) {
+        log_error("atop_upgrade_get: failed to create JSON object");
         return OPRT_MALLOC_FAILED;
     }
     cJSON_AddNumberToObject(root, "type", request->channel);
-    if (request->sw_ver && request->sw_ver[0] != '\0') {
-        cJSON_AddStringToObject(root, "softVer", request->sw_ver);
-    }
     cJSON_AddNumberToObject(root, "t", (double)timestamp);
 
     char *post_data = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (post_data == NULL) {
+        log_error("atop_upgrade_get: failed to print JSON");
         return OPRT_MALLOC_FAILED;
     }
 
@@ -788,7 +796,7 @@ int atop_upgrade_get(const pal_t *pal, const ota_upgrade_request_t *request, ota
     cJSON *result = atop_response.result;
     if (result == NULL) {
         /* success=true but result=null → cloud has no upgrade configured for this device */
-        log_debug("atop_upgrade_get: no upgrade available (success=%d)", atop_response.success);
+        log_debug("atop_upgrade_get: no upgrade available");
         atop_base_response_free(pal, &atop_response);
         return OPRT_OK;   /* no-upgrade is success; response->has_upgrade stays false */
     }
@@ -883,6 +891,7 @@ int atop_version_update(const pal_t *pal, const ota_version_update_request_t *re
     #define VER_UPDATE_BUF_LEN 256
     char *post_data = (char *)pal->malloc(VER_UPDATE_BUF_LEN);
     if (post_data == NULL) {
+        log_error("atop_version_update: malloc failed");
         return OPRT_MALLOC_FAILED;
     }
 
@@ -891,6 +900,7 @@ int atop_version_update(const pal_t *pal, const ota_version_update_request_t *re
         "\\\"baselineVer\\\":\\\"%s\\\",\\\"softVer\\\":\\\"%s\\\"}]\",\"t\":%" PRIu32 "}",
         request->channel, pv, bv, request->sw_ver, timestamp);
     if (write_len < 0 || (size_t)write_len >= VER_UPDATE_BUF_LEN) {
+        log_error("atop_version_update: failed to build post data, write_len=%d", write_len);
         pal->free(post_data);
         return OPRT_COMMUNICATION_ERROR;
     }
@@ -923,13 +933,9 @@ int atop_version_update(const pal_t *pal, const ota_version_update_request_t *re
         return rt;
     }
 
-    bool success = atop_response.success;
+    /* OPRT_OK from atop_base_request() implies success == true -- a rejected
+     * envelope now returns OPRT_ATOP_BUSINESS_ERROR and is caught above. */
     atop_base_response_free(pal, &atop_response);
-
-    if (!success) {
-        log_error("atop_version_update: cloud returned failure");
-        return OPRT_COMMUNICATION_ERROR;
-    }
 
     log_debug("atop_version_update: success");
     return OPRT_OK;
@@ -951,6 +957,7 @@ int atop_upgrade_status_update(const pal_t *pal, const ota_status_update_request
     #define STATUS_UPD_BUF_LEN 128
     char *post_data = (char *)pal->malloc(STATUS_UPD_BUF_LEN);
     if (post_data == NULL) {
+        log_error("atop_upgrade_status_update: malloc failed");
         return OPRT_MALLOC_FAILED;
     }
 
@@ -990,13 +997,9 @@ int atop_upgrade_status_update(const pal_t *pal, const ota_status_update_request
         return rt;
     }
 
-    bool success = atop_response.success;
+    /* OPRT_OK from atop_base_request() implies success == true -- a rejected
+     * envelope now returns OPRT_ATOP_BUSINESS_ERROR and is caught above. */
     atop_base_response_free(pal, &atop_response);
-
-    if (!success) {
-        log_error("atop_upgrade_status_update: cloud returned failure");
-        return OPRT_COMMUNICATION_ERROR;
-    }
 
     log_debug("atop_upgrade_status_update: success (channel=%d, status=%d)",
               request->channel, (int)request->status);

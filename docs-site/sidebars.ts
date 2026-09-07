@@ -26,7 +26,9 @@ const sidebars: SidebarsConfig = {
           label: 'AI功能',
           items: [
             'tutorials/chat',
+            'tutorials/music-play',
             'tutorials/edu-camera',
+            'tutorials/agent-trigger',
           ],
         },
       ],
@@ -39,6 +41,7 @@ const sidebars: SidebarsConfig = {
           type: 'category',
           label: '云端配置',
           items: [
+            'guides/create-cloud-project',
             'guides/create-agent',
             'guides/create-workflow',
           ],
@@ -52,6 +55,7 @@ const sidebars: SidebarsConfig = {
             'guides/dp-persistence',
             'guides/device-mcp',
             'guides/ota-upgrade',
+            'guides/atop-generic-call',
             'guides/tls-cert-verification',
             'guides/porting-to-new-platform',
           ],

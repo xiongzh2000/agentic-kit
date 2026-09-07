@@ -22,6 +22,7 @@ sidebar_position: 1
 | 工具/库 | 版本 | macOS 安装 | Linux (Debian/Ubuntu) 安装 |
 |---------|------|-----------|---------------------------|
 | CMake | ≥ 3.20 | `brew install cmake` | `apt install cmake` |
+| Python3 | ≥ 3.x | `brew install python3` | `apt install python3` |
 
 > 构建系统会自动编译 bundled 的 mbedTLS、cJSON、coreHTTP、coreMQTT 依赖，无需单独安装。
 
@@ -39,15 +40,15 @@ mkdir -p build && cd build
 cmake .. && make
 ```
 
-CMakeLists.txt 会自动选择平台对应的预编译库目录：
+CMakeLists.txt 会自动选择平台对应的预编译库目录（位于 `modules/rtc-client/libs/`）：
 
 | 平台 | 库目录 |
 |------|--------|
-| macOS arm64 | `libs/macos_arm64/` |
-| Linux x86_64 | `libs/linux-gnu-amd64/` |
-| Linux aarch64 | `libs/linux-gnu-aarch64/` |
+| macOS arm64 | `modules/rtc-client/libs/macos_arm64/` |
+| Linux x86_64 | `modules/rtc-client/libs/linux-gnu-amd64/` |
+| Linux aarch64 | `modules/rtc-client/libs/linux-gnu-aarch64/` |
 
-其他可用预编译库（需手动指定）：`libs/rockchip830-arm/`、`libs/ingenic-mips/`。
+其他可用预编译库：`modules/rtc-client/libs/rockchip830-arm/`、`modules/rtc-client/libs/ingenic-mips/`。交叉编译这两个平台时，库目录的选择逻辑硬编码在根 `CMakeLists.txt` 的平台判断中（`STEAM_CLIENT_LIB_DIR`），需自行修改该处指向对应目录。
 
 
 ### 示例代码编译
@@ -81,18 +82,26 @@ idf.py flash monitor
 
 ```sh
 # --- AI 实时交互：rtc-tcp-client（源码）---
-./build/tai_text_chat_demo                 # 文本对话
-./build/tai_audio_chat_demo input.wav      # 语音对话（需 libopus；省略文件则发文字问候，WAV 须为单声道 16-bit）
-./build/tai_edu_camera_demo res/test.jpg   # 拍照识物 + TTS
-./build/tai_mcp_demo                       # 设备 MCP（initialize 握手 + 工具调用）
+./build/text_chat_demo                 # 文本对话
+./build/audio_chat_demo input.wav      # 语音对话（需 libopus；省略文件则发文字问候，WAV 须为单声道 16-bit）
+./build/edu_camera_demo res/test.jpg   # 拍照识物 + TTS
+./build/music_play_demo                # 音乐播放（文本触发音乐技能，下载试听片段）
+./build/mcp_demo                       # 设备 MCP（initialize 握手 + 工具调用）
+./build/agent_trigger_demo             # 智能体触发器（上报 DP 触发云端规则，接收主动推送）
 
 # --- AI 实时交互：rtc-client（预编译库，stm_open API）---
-./build/chat_demo                          # 语音聊天
+./build/udp_chat_demo                          # 语音聊天
 
 # 设备扫码配网示例（默认使用 res/qr.jpg）
 ./build/scan_by_device_pair_demo
+
+# 云端移除设备 / 恢复出厂通知（被动接收 protocol 11）
+./build/unbind_demo <devid> <secret_key> <local_key>
+
+# 设备侧主动解绑：与激活成对，放在激活示例里
+./build/activate_demo <token> --release
 ```
 
-> 上述 AI demo 均内置默认设备凭据，可直接运行；要用自己的设备时，多数 demo 支持追加 `[devid] [secret_key] [local_key]` 参数。`tai_audio_chat_demo` 仅在检测到 libopus 时才会编译。
+> 上述 AI demo 均内置默认设备凭据，可直接运行；要用自己的设备时，多数 demo 支持追加 `[devid] [secret_key] [local_key]` 参数（`agent_trigger_demo` 用命名参数，见 `--help`）。`audio_chat_demo` 仅在检测到 libopus 时才会编译。
 
 

@@ -67,6 +67,7 @@ void atop_activate_response_free(const pal_t *pal, activite_response_t *response
  */
 typedef struct {
     char *token;                     // JSON string (caller must free)
+    iot_atop_rejection_t rejection;  // filled when the cloud refused; code "" otherwise
 } ai_token_response_t;
 
 /**
@@ -146,6 +147,7 @@ typedef struct {
  */
 int atop_device_meta_save(const pal_t *pal, const device_meta_save_request_t *request, device_meta_save_response_t *response);
 
+
 /**
  * @brief Get QR code info from Tuya cloud (tuya.device.qrcode.info.get)
  *
@@ -205,7 +207,6 @@ typedef struct {
     const char *devid;
     const char *key;
     int channel;        /**< firmware type/channel (0 = main MCU) */
-    const char *sw_ver; /**< current firmware version (sent as softVer for server-side comparison) */
     const char *host;
     uint16_t port;
     const char *cacert;
